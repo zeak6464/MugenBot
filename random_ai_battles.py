@@ -20,6 +20,9 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
+import msvcrt  # For Windows file locking
+import psutil
+import shutil
 
 class MugenBattleManager:
     def __init__(self):
@@ -99,24 +102,114 @@ class MugenBattleManager:
         return stages
 
     def load_stats(self, file_path: Path) -> Dict:
-        """Load statistics from JSON"""
-        if file_path.exists():
+        """Load statistics with validation and repair"""
+        try:
+            if not file_path.exists():
+                print("No stats file found, starting fresh")
+                return {}  # Return empty dict instead of None
+            
+            # Try to load main file
             try:
-                with open(file_path) as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-        return {}
+                with open(file_path, 'r') as f:
+                    stats = json.load(f)
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"Error loading stats file: {e}")
+                # Try backup
+                backup_path = file_path.with_suffix('.json.bak')
+                if backup_path.exists():
+                    print("Attempting to load from backup...")
+                    with open(backup_path, 'r') as f:
+                        stats = json.load(f)
+                else:
+                    print("No backup found, starting fresh")
+                    return {}  # Return empty dict instead of None
+            
+            # Validate and repair stats
+            if 'character_stats' in stats:
+                self.character_stats = self._validate_character_stats(stats['character_stats'])
+            if 'stage_stats' in stats:
+                self.stage_stats = self._validate_stage_stats(stats['stage_stats'])
+            if 'battle_durations' in stats:
+                self.battle_durations = stats['battle_durations'][-1000:]  # Keep last 1000
+                
+            return stats  # Return the loaded stats
+                
+        except Exception as e:
+            print(f"Error loading stats: {e}")
+            traceback.print_exc()
+            # Start fresh if all else fails
+            return {}
+    
+    def _validate_character_stats(self, stats):
+        """Validate and repair character statistics"""
+        validated = {}
+        for char, data in stats.items():
+            if not isinstance(data, dict):
+                data = {'wins': 0, 'losses': 0}
+            if 'wins' not in data or not isinstance(data['wins'], int):
+                data['wins'] = 0
+            if 'losses' not in data or not isinstance(data['losses'], int):
+                data['losses'] = 0
+            validated[char] = data
+        return validated
+    
+    def _validate_stage_stats(self, stats):
+        """Validate and repair stage statistics"""
+        validated = {}
+        for stage, data in stats.items():
+            if not isinstance(data, dict):
+                data = {
+                    "times_used": 0,
+                    "last_used": "Never",
+                    "total_duration": 0
+                }
+            if "times_used" not in data or not isinstance(data["times_used"], int):
+                data["times_used"] = 0
+            if "last_used" not in data:
+                data["last_used"] = "Never"
+            if "total_duration" not in data or not isinstance(data["total_duration"], (int, float)):
+                data["total_duration"] = 0
+            validated[stage] = data
+        return validated
 
     def save_stats(self):
-        """Save all statistics to JSON"""
-        # Save character stats
-        with open(self.stats_file, 'w') as f:
-            json.dump(self.character_stats, f, indent=2)
-        
-        # Save stage stats
-        with open(self.stage_stats_file, 'w') as f:
-            json.dump(self.stage_stats, f, indent=2)
+        """Save statistics with backup mechanism"""
+        try:
+            # Create backup of existing stats
+            if self.stats_file.exists():
+                backup_path = self.stats_file.with_suffix('.json.bak')
+                import shutil
+                shutil.copy2(self.stats_file, backup_path)
+            
+            # Save current stats with atomic write
+            temp_path = self.stats_file.with_suffix('.json.tmp')
+            stats_data = {
+                'character_stats': self.character_stats,
+                'stage_stats': self.stage_stats,
+                'battle_durations': self.battle_durations[-1000:],  # Keep last 1000 battles
+                'last_save': time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # Write to temporary file first
+            with open(temp_path, 'w') as f:
+                json.dump(stats_data, f, indent=2)
+            
+            # Atomic rename
+            import os
+            os.replace(temp_path, self.stats_file)
+            
+        except Exception as e:
+            print(f"Error saving stats: {e}")
+            traceback.print_exc()
+            # Try to restore from backup
+            try:
+                backup_path = self.stats_file.with_suffix('.json.bak')
+                if backup_path.exists():
+                    import shutil
+                    shutil.copy2(backup_path, self.stats_file)
+                    print("Restored stats from backup")
+            except Exception as be:
+                print(f"Error restoring backup: {be}")
 
     def update_stats(self, winner: str, loser: str):
         """Update win/loss statistics"""
@@ -182,31 +275,49 @@ class MugenBattleManager:
         else: return "D"
 
     def start_battle(self, battle_info=None):
-        """Start a MUGEN battle with current settings"""
+        """Start a MUGEN battle with current settings and proper process management"""
         if not self.settings["enabled_characters"]:
             raise ValueError("No characters are enabled!")
         if not self.settings["enabled_stages"]:
             raise ValueError("No stages are enabled!")
 
-        # Clean up any existing processes
+        # Clean up any existing processes first
+        try:
+            subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)  # Wait for process cleanup
+        except:
+            pass
+
         if self.watcher_process:
-            self.watcher_process.terminate()
+            try:
+                self.watcher_process.terminate()
+                time.sleep(0.5)
+            except:
+                pass
             self.watcher_process = None
+
+        # Clean up log file
         if self.watcher_log.exists():
             try:
                 self.watcher_log.unlink()
             except PermissionError:
                 print("Warning: Could not delete old log file")
+                time.sleep(0.5)
+            try:
+                self.watcher_log.unlink()
+            except:
+                pass
 
         # Start MugenWatcher before battle
-        self.ensure_watcher_running()
+        if not self.ensure_watcher_running():
+            raise RuntimeError("Failed to start MugenWatcher")
 
         # Use provided battle info or prepare new one
         if battle_info is None:
             battle_info = self.prepare_battle()
         
-        print("Starting battle with:", battle_info)  # Debug print
-        
+        print("Starting battle with:", battle_info)
+
         # Handle infinite time setting
         time_setting = self.settings.get("time", "99")
         if time_setting == "∞":
@@ -221,7 +332,6 @@ class MugenBattleManager:
 
         # Add character commands based on battle mode
         if battle_info['mode'] == "single":
-            # Single battle mode
             cmd.extend([
                 "-p1", f"chars/{battle_info['p1']}/{battle_info['p1']}.def",
                 "-p1.ai", "1",
@@ -229,8 +339,7 @@ class MugenBattleManager:
                 "-p2.ai", "1",
                 "-p2.color", str(self.settings["p2_color"])
             ])
-        elif battle_info['mode'] == "team":
-            # Team battle mode
+        elif battle_info['mode'] in ["team", "turns", "simul"]:
             cmd.extend([
                 "-p1.teammember", str(self.settings["team_size"]),
                 "-p1.ai", "1"
@@ -247,20 +356,25 @@ class MugenBattleManager:
             ])
             for char in battle_info['p2']:
                 cmd.extend([f"chars/{char}/{char}.def"])
-        
-        # Add stage with proper path (stages/*.def)
-        stage_path = f"stages/{battle_info['stage']}.def"  # Add stages/ prefix back
+
+        # Add stage with proper path
+        stage_path = f"stages/{battle_info['stage']}.def"
         cmd.extend(["-s", stage_path])
 
-        print("Running command:", cmd)  # Debug print
+        print("Running command:", cmd)
 
         try:
-            # Kill any existing MUGEN process
-            subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
-            time.sleep(0.5)  # Wait a bit for the process to close
+            # Start MUGEN process with timeout handling
+            process = subprocess.Popen(cmd, cwd=str(self.mugen_path.parent))
             
-            # Start MUGEN with the time parameter
-            subprocess.Popen(cmd, cwd=str(self.mugen_path.parent))
+            # Wait up to 5 seconds for process to start
+            for _ in range(50):
+                if self._check_mugen_running():
+                    break
+                time.sleep(0.1)
+            
+            if not self._check_mugen_running():
+                raise RuntimeError("MUGEN process failed to start")
             
             # Record battle start time
             self.battle_start_time = time.time()
@@ -271,14 +385,26 @@ class MugenBattleManager:
             return battle_info
         except Exception as e:
             print(f"Error starting battle: {e}")
+            traceback.print_exc()
+            # Clean up on error
+            if process:
+                try:
+                    process.terminate()
+                except:
+                    pass
             raise
 
     def _check_mugen_running(self) -> bool:
-        """Check if MUGEN is still running"""
+        """Check if MUGEN is still running with timeout"""
         try:
-            # Look for mugen.exe in running processes
-            output = subprocess.check_output('tasklist', shell=True).decode()
-            return "mugen.exe" in output.lower()
+            # Look for mugen.exe in running processes with timeout
+            process = subprocess.Popen(['tasklist'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                stdout, _ = process.communicate(timeout=3)  # 3 second timeout
+                return "mugen.exe" in stdout.decode().lower()
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return False
         except:
             return False
 
@@ -289,12 +415,10 @@ class MugenBattleManager:
 
         # Check if MUGEN is still running
         mugen_running = self._check_mugen_running()
-        print(f"MUGEN running: {mugen_running}")  # Debug print
         
         if not mugen_running:
             # Try to get final result
             result = self._read_battle_result()
-            print(f"Battle result read: {result}")  # Debug print
             
             # Clean up watcher
             if self.watcher_process:
@@ -311,7 +435,6 @@ class MugenBattleManager:
         # MUGEN is still running, check for results
         result = self._read_battle_result()
         if result:
-            print(f"Battle result read while running: {result}")  # Debug print
             return self._process_battle_result(result)
         
         return None
@@ -613,54 +736,58 @@ class MugenBattleManager:
         subprocess.Popen(cmd)
         return self.current_battle
 
-    def _read_battle_result(self) -> Optional[tuple]:
-        """Read battle result from MugenWatcher.Log"""
+    def _read_battle_result(self) -> Optional[Dict]:
+        """Read battle result from watcher log with Windows file locking"""
         if not self.watcher_log.exists():
-            print("Watcher log does not exist")  # Debug print
-            
-            # Check if watcher process is running
-            if self.watcher_process and self.watcher_process.poll() is None:
-                print("Watcher process is running, waiting for log file...")
-            else:
-                print("Watcher process not running, attempting to restart...")
-                try:
-                    watcher_cmd = ["MugenWatcher.exe"]
-                    self.watcher_process = subprocess.Popen(watcher_cmd)
-                    print("Restarted MugenWatcher process")
-                except Exception as e:
-                    print(f"Error restarting watcher: {e}")
             return None
-        
-        # Try to read the log file with proper file handling
-        for _ in range(3):  # Try up to 3 times
-            try:
-                # Open with 'r' mode and proper encoding
-                with open(self.watcher_log, 'r', encoding='utf-8') as f:
+            
+        try:
+            with open(self.watcher_log, 'r') as f:
+                # Acquire lock for reading
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
                     lines = f.readlines()
-                    if lines:
-                        last_line = lines[-1].strip()
-                        print(f"Read from watcher log: {last_line}")  # Debug print
-                        try:
-                            # Split by comma and get the scores
-                            values = last_line.split(',')
-                            if len(values) >= 4:
-                                p1_score = int(values[2])
-                                p2_score = int(values[3])
-                                print(f"Parsed scores: P1={p1_score}, P2={p2_score}")  # Debug print
-                                return (p1_score, p2_score)
-                        except (ValueError, IndexError) as e:
-                            print(f"Error parsing battle result: {e}")
-                            return None
+                finally:
+                    # Release lock
+                    try:
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    except:
+                        pass
+                
+                if not lines:
+                    return None
+                
+                # Process the last line for result
+                last_line = lines[-1].strip()
+                if not last_line:
+                    return None
+                
+                try:
+                    # Try parsing as JSON first
+                    return json.loads(last_line)
+                except json.JSONDecodeError:
+                    # If not JSON, try parsing as comma-separated values
+                    try:
+                        values = last_line.split(',')
+                        if len(values) >= 4:
+                            # Format: timestamp, process_id, p1_score, p2_score
+                            p1_score = int(values[2])
+                            p2_score = int(values[3])
+                            return [p1_score, p2_score]
+                    except (ValueError, IndexError) as e:
+                        print(f"Error parsing battle result values: {e}")
+                    return None
+                
+        except IOError as e:
+            if "Permission denied" in str(e):
+                print("File is locked by another process")
                 return None
-            except PermissionError:
-                # File is locked, wait a moment and try again
-                print("Log file is locked, waiting...")
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"Error reading battle result: {e}")
-                return None
-        
-        return None
+            print(f"Error reading battle result: {e}")
+            return None
+        except Exception as e:
+            print(f"Error reading battle result: {e}")
+            traceback.print_exc()
+            return None
 
     def load_battle_history(self) -> Dict:
         """Load battle history from JSON"""
@@ -697,7 +824,17 @@ class MugenBattleManager:
         try:
             # Kill any existing watcher process
             if self.watcher_process:
-                self.watcher_process.terminate()
+                try:
+                    self.watcher_process.terminate()
+                    # Wait up to 3 seconds for process to terminate
+                    for _ in range(30):
+                        if self.watcher_process.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                    if self.watcher_process.poll() is None:
+                        self.watcher_process.kill()  # Force kill if not terminated
+                except Exception as e:
+                    print(f"Error terminating watcher: {e}")
                 self.watcher_process = None
 
             # Clean up old log file
@@ -706,22 +843,36 @@ class MugenBattleManager:
                     self.watcher_log.unlink()
                 except PermissionError:
                     print("Warning: Could not delete old log file")
+                    time.sleep(0.5)  # Wait and try again
+                    try:
+                        self.watcher_log.unlink()
+                    except:
+                        pass
 
             # Check if MugenWatcher exists
             if not self.watcher_path.exists():
                 print("Warning: MugenWatcher.exe not found. Battle results won't be tracked.")
                 return False
 
-            # Start MugenWatcher regardless of MUGEN's state
-            self.watcher_process = subprocess.Popen(
-                [str(self.watcher_path)],
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            time.sleep(0.5)  # Brief pause to let watcher initialize
-            return True
+            # Start MugenWatcher with timeout
+            try:
+                self.watcher_process = subprocess.Popen(
+                    [str(self.watcher_path)],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                )
+                # Wait up to 5 seconds for watcher to initialize
+                for _ in range(50):
+                    if self.watcher_log.exists():
+                        break
+                    time.sleep(0.1)
+                return True
+            except Exception as e:
+                print(f"Error starting MugenWatcher: {e}")
+                return False
 
         except Exception as e:
-            print(f"Error starting MugenWatcher: {e}")
+            print(f"Error in ensure_watcher_running: {e}")
+            traceback.print_exc()
             return False
 
     def prepare_battle(self):
@@ -834,16 +985,28 @@ class TwitchBot(commands.Bot):
             "!help - Show this help message",
             "!stats - Show current battle stats"
         ]
+        
+        # Add connection state tracking
+        self.connected = False
+        self.connection_retries = 0
+        self.MAX_RETRIES = 3
+        self.last_connection_attempt = 0
+        self.RETRY_DELAY = 60  # seconds between retry attempts
 
         # Initialize the bot
-        super().__init__(token=token, prefix='!', initial_channels=[channel], nick=bot_name)
-        self.channel = None
+        try:
+            super().__init__(token=token, prefix='!', initial_channels=[channel], nick=bot_name)
+            self.channel = None
+        except Exception as e:
+            print(f"Failed to initialize Twitch bot: {e}")
+            traceback.print_exc()
+            raise
 
     async def event_ready(self):
         """Called once when the bot goes online."""
-        print(f"Bot is ready! Logged in as {self.nick}")
-        
         try:
+            print(f"Bot is ready! Logged in as {self.nick}")
+            
             # Wait for WebSocket connection
             await asyncio.sleep(2)
             
@@ -853,19 +1016,168 @@ class TwitchBot(commands.Bot):
             
             if self.channel:
                 print(f"Successfully connected to channel: {self.channel_name}")
+                self.connected = True
+                self.connection_retries = 0
                 if self.battle_gui:
                     self.battle_gui.root.after(0, self.battle_gui.update_twitch_status, True)
                 await self._connection.send(f"PRIVMSG #{self.channel_name} :MugenBattleBot connected! Type !help for commands")
             else:
                 print(f"Could not connect to channel: {self.channel_name}")
+                self.connected = False
                 if self.battle_gui:
                     self.battle_gui.root.after(0, self.battle_gui.update_twitch_status, False)
                     
         except Exception as e:
-            print(f"Error connecting to channel: {e}")
+            print(f"Error in event_ready: {e}")
             traceback.print_exc()
+            self.connected = False
             if self.battle_gui:
                 self.battle_gui.root.after(0, self.battle_gui.update_twitch_status, False)
+
+    async def event_error(self, error: Exception, data: Optional[str] = None):
+        """Handle connection errors"""
+        print(f"Twitch bot error: {error}")
+        traceback.print_exc()
+        
+        self.connected = False
+        if self.battle_gui:
+            self.battle_gui.root.after(0, self.battle_gui.update_twitch_status, False)
+        
+        # Attempt reconnection if appropriate
+        current_time = time.time()
+        if (current_time - self.last_connection_attempt > self.RETRY_DELAY and 
+            self.connection_retries < self.MAX_RETRIES):
+            self.connection_retries += 1
+            self.last_connection_attempt = current_time
+            print(f"Attempting reconnection (attempt {self.connection_retries}/{self.MAX_RETRIES})")
+            try:
+                await self.connect()
+            except Exception as e:
+                print(f"Reconnection failed: {e}")
+
+    async def create_battle_poll(self, title, option1, option2, duration):
+        """Start betting period with preview and error handling"""
+        try:
+            if not self.connected:
+                print("Cannot create poll: Bot not connected")
+                return False
+                
+            # Reset and initialize betting
+            self.betting_active = True
+            self.current_bets = {"1": {}, "2": {}}
+            
+            # Announce battle and betting with timeout
+            async with asyncio.timeout(5):  # 5 second timeout for announcements
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :🎲 NEW BATTLE BETTING STARTED! 🎲")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :⚔️ {title}")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :Team 1: {option1}")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :Team 2: {option2}")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :Type !bet 1 <amount> to bet on Team 1")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :Type !bet 2 <amount> to bet on Team 2")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :New users get 1000 points! Betting closes in {duration} seconds!")
+            
+            return True
+            
+        except asyncio.TimeoutError:
+            print("Timeout while creating battle poll")
+            self.betting_active = False
+            self.current_bets = {"1": {}, "2": {}}
+            return False
+        except Exception as e:
+            print(f"Error creating betting: {e}")
+            traceback.print_exc()
+            self.betting_active = False
+            self.current_bets = {"1": {}, "2": {}}
+            return False
+
+    async def handle_battle_result(self, winner, p1, p2):
+        """Handle battle result and distribute points with error handling"""
+        try:
+            if not self.connected:
+                print("Cannot handle result: Bot not connected")
+                return
+                
+            # Format winner announcement
+            if isinstance(winner, list):
+                winner_text = "Team " + " & ".join(winner)
+                loser_text = "Team " + " & ".join(p2 if winner == p1 else p1)
+            else:
+                winner_text = winner
+                loser_text = p2 if winner == p1 else p1
+
+            # Determine winning team
+            winning_team = "1" if winner == p1 else "2"
+            losing_team = "2" if winning_team == "1" else "1"
+            
+            # Calculate total pools
+            winning_pool = sum(self.current_bets[winning_team].values())
+            losing_pool = sum(self.current_bets[losing_team].values())
+            total_pool = winning_pool + losing_pool
+            
+            # Track winners and their earnings
+            winners_earnings = []
+            
+            # Announce results with timeout
+            async with asyncio.timeout(5):
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :🏆 Battle Results! 🏆")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :Winner: {winner_text}")
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :Defeated: {loser_text}")
+            
+            if total_pool > 0:
+                # Calculate payout ratio
+                if winning_pool > 0:
+                    payout_ratio = (total_pool / winning_pool) if winning_pool > 0 else 2.0
+                else:
+                    payout_ratio = 2.0  # Default 2x payout if no winners
+                
+                # Distribute winnings with timeout
+                async with asyncio.timeout(10):
+                    for user, bet in self.current_bets[winning_team].items():
+                        winnings = int(bet * payout_ratio)
+                        self.user_points[user] = self.user_points.get(user, 0) + winnings
+                        winners_earnings.append((user, winnings, bet))
+                        await self._connection.send(
+                            f"PRIVMSG #{self.channel_name} :💰 {user} won {winnings:,} points! "
+                            f"(Bet: {bet:,}, Payout: {payout_ratio:.2f}x)"
+                        )
+                
+                # Save updated points
+                self.save_user_points()
+            else:
+                await self._connection.send(f"PRIVMSG #{self.channel_name} :No bets were placed on this battle!")
+            
+            # Announce top winners with timeout
+            if winners_earnings:
+                winners_earnings.sort(key=lambda x: x[1], reverse=True)
+                async with asyncio.timeout(5):
+                    await self._connection.send(f"PRIVMSG #{self.channel_name} :🎰 Top Winners 🎰")
+                    for i, (user, winnings, bet) in enumerate(winners_earnings[:3], 1):
+                        profit = winnings - bet
+                        if i == 1:
+                            await self._connection.send(
+                                f"PRIVMSG #{self.channel_name} :🥇 {user} - Won: {winnings:,} points "
+                                f"(Profit: {profit:,}) 🎊"
+                            )
+                        elif i == 2:
+                            await self._connection.send(
+                                f"PRIVMSG #{self.channel_name} :🥈 {user} - Won: {winnings:,} points "
+                                f"(Profit: {profit:,})"
+                            )
+                        else:
+                            await self._connection.send(
+                                f"PRIVMSG #{self.channel_name} :🥉 {user} - Won: {winnings:,} points "
+                                f"(Profit: {profit:,})"
+                            )
+            
+        except asyncio.TimeoutError:
+            print("Timeout while handling battle result")
+        except Exception as e:
+            print(f"Error handling battle result: {e}")
+            traceback.print_exc()
+        finally:
+            # Always reset betting state
+            self.betting_active = False
+            self.current_bets = {"1": {}, "2": {}}
 
     def load_user_points(self) -> dict:
         """Load user points from file"""
@@ -968,100 +1280,6 @@ class TwitchBot(commands.Bot):
                 await ctx.send(f"Current Battle: Team {team1} vs Team {team2} on {battle['stage']}")
         else:
             await ctx.send("No battle in progress")
-
-    async def handle_battle_result(self, winner, p1, p2):
-        """Handle battle result and distribute points"""
-        try:
-            # Format winner announcement
-            if isinstance(winner, list):
-                winner_text = "Team " + " & ".join(winner)
-                loser_text = "Team " + " & ".join(p2 if winner == p1 else p1)
-            else:
-                winner_text = winner
-                loser_text = p2 if winner == p1 else p1
-
-            # Determine winning team
-            winning_team = "1" if winner == p1 else "2"
-            losing_team = "2" if winning_team == "1" else "1"
-            
-            # Calculate total pools
-            winning_pool = sum(self.current_bets[winning_team].values())
-            losing_pool = sum(self.current_bets[losing_team].values())
-            total_pool = winning_pool + losing_pool
-            
-            # Track winners and their earnings
-            winners_earnings = []
-            
-            # Announce results
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :🏆 Battle Results! 🏆")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :Winner: {winner_text}")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :Defeated: {loser_text}")
-            
-            if total_pool > 0:
-                # Calculate payout ratio
-                if winning_pool > 0:
-                    payout_ratio = (total_pool / winning_pool) if winning_pool > 0 else 2.0
-                else:
-                    payout_ratio = 2.0  # Default 2x payout if no winners
-                
-                # Distribute winnings
-                for user, bet in self.current_bets[winning_team].items():
-                    winnings = int(bet * payout_ratio)
-                    self.user_points[user] = self.user_points.get(user, 0) + winnings
-                    winners_earnings.append((user, winnings, bet))
-                    await self._connection.send(f"PRIVMSG #{self.channel_name} :💰 {user} won {winnings:,} points! (Bet: {bet:,}, Payout: {payout_ratio:.2f}x)")
-                
-                # Save updated points
-                self.save_user_points()
-            else:
-                await self._connection.send(f"PRIVMSG #{self.channel_name} :No bets were placed on this battle!")
-            
-            # Announce top winners
-            if winners_earnings:
-                winners_earnings.sort(key=lambda x: x[1], reverse=True)
-                await self._connection.send(f"PRIVMSG #{self.channel_name} :🎰 Top Winners 🎰")
-                for i, (user, winnings, bet) in enumerate(winners_earnings[:3], 1):
-                    profit = winnings - bet
-                    if i == 1:
-                        await self._connection.send(f"PRIVMSG #{self.channel_name} :🥇 {user} - Won: {winnings:,} points (Profit: {profit:,}) 🎊")
-                    elif i == 2:
-                        await self._connection.send(f"PRIVMSG #{self.channel_name} :🥈 {user} - Won: {winnings:,} points (Profit: {profit:,})")
-                    else:
-                        await self._connection.send(f"PRIVMSG #{self.channel_name} :🥉 {user} - Won: {winnings:,} points (Profit: {profit:,})")
-            
-            # Reset betting state
-            self.betting_active = False
-            self.current_bets = {"1": {}, "2": {}}
-            
-        except Exception as e:
-            print(f"Error handling battle result: {e}")
-            traceback.print_exc()
-            self.betting_active = False
-            self.current_bets = {"1": {}, "2": {}}
-
-    async def create_battle_poll(self, title, option1, option2, duration):
-        """Start betting period with preview"""
-        try:
-            # Reset and initialize betting
-            self.betting_active = True
-            self.current_bets = {"1": {}, "2": {}}
-            
-            # Announce battle and betting
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :🎲 NEW BATTLE BETTING STARTED! 🎲")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :⚔️ {title}")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :Team 1: {option1}")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :Team 2: {option2}")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :Type !bet 1 <amount> to bet on Team 1")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :Type !bet 2 <amount> to bet on Team 2")
-            await self._connection.send(f"PRIVMSG #{self.channel_name} :New users get 1000 points! Betting closes in {duration} seconds!")
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error creating betting: {e}")
-            self.betting_active = False
-            self.current_bets = {"1": {}, "2": {}}
-            return False
 
     async def end_poll(self):
         """End the current betting period"""
@@ -1530,15 +1748,37 @@ class BattleGUI:
     def _start_actual_battle(self):
         """Start the actual battle with prepared info"""
         try:
-            if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
-                print("Starting battle with prepared info:", self.prepared_battle_info)
-                self.manager.start_battle(self.prepared_battle_info)
-                self.battle_monitor = self.root.after(1000, self._check_battle_result)
-            else:
-                print("No prepared battle info available")
+            # Check if battle is already running
+            if self.battle_monitor:
+                print("Battle already in progress, skipping start")
+                return
+
+            if not hasattr(self, 'prepared_battle_info') or not self.prepared_battle_info:
+                print("No battle info available")
+                return
+
+            # Close preview window before starting battle
+            if hasattr(self, 'preview_window') and self.preview_window:
+                try:
+                    self.preview_window.destroy()
+                except:
+                    pass
+                self.preview_window = None
+
+            # Store battle info and clear prepared info to prevent duplicate starts
+            battle_info = self.prepared_battle_info
+            self.prepared_battle_info = None
+
+            print("Starting actual battle with:", battle_info)
+            self.manager.start_battle(battle_info)
+            self.battle_monitor = self.root.after(1000, self._check_battle_result)
+            
         except Exception as e:
-            print(f"Error starting battle: {e}")
+            print(f"Error starting actual battle: {e}")
             traceback.print_exc()
+            if self.battle_monitor:
+                self.root.after_cancel(self.battle_monitor)
+                self.battle_monitor = None
 
     def stop_battle(self):
         """Stop the current battle and clean up"""
@@ -1566,17 +1806,28 @@ class BattleGUI:
             # Find and terminate MUGEN process
             try:
                 subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
+                time.sleep(0.5)  # Give process time to terminate
             except:
                 pass
 
             # Clean up MugenWatcher
             if self.manager.watcher_process:
-                self.manager.watcher_process.terminate()
-                self.manager.watcher_process = None
+                try:
+                    self.manager.watcher_process.terminate()
+                    time.sleep(0.5)  # Give process time to terminate
+                    self.manager.watcher_process = None
+                except:
+                    pass
 
-            # Clear current battle state
+            # Clear all battle states
             self.manager.current_battle = None
             self.prepared_battle_info = None
+            self.manager.battle_start_time = None
+            
+            # Reset Twitch betting state
+            if self.twitch_bot:
+                self.twitch_bot.betting_active = False
+                self.twitch_bot.current_bets = {"1": {}, "2": {}}
 
             # Log battle stop
             timestamp = time.strftime("%H:%M:%S")
@@ -1585,7 +1836,12 @@ class BattleGUI:
                 self.battle_log.see(tk.END)
 
         except Exception as e:
-            print(f"Failed to stop battle: {str(e)}")  # Debug print
+            print(f"Failed to stop battle: {str(e)}")
+            traceback.print_exc()  # Add stack trace for debugging
+            # Try emergency cleanup
+            self.manager.current_battle = None
+            self.prepared_battle_info = None
+            self.battle_monitor = None
 
     def update_twitch_status(self, connected: bool):
         """Update Twitch connection status in GUI"""
@@ -2548,6 +2804,10 @@ class BattleGUI:
         self._populate_stage_list()
 
     def run(self):
+        """Start the GUI with memory monitoring"""
+        # Start memory monitoring
+        self._monitor_memory_usage()
+        # Run the main loop
         self.root.mainloop()
 
     def export_stats(self):
@@ -2705,19 +2965,47 @@ and Chickenbone's modifications.
 
     def _sort_stats(self, column):
         """Sort statistics by the selected column"""
+        # Store the current sort column and order
+        if not hasattr(self, '_sort_column'):
+            self._sort_column = None
+            self._sort_reverse = False
+        
+        # Toggle sort order if clicking the same column
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+
+        # Get all items with their values
         items = [(self.stats_tree.set(item, column), item) for item in self.stats_tree.get_children("")]
         
+        # Convert values for proper sorting
+        def convert_value(value):
+            try:
+                # Handle percentage values
+                if isinstance(value, str) and value.endswith('%'):
+                    return float(value.rstrip('%'))
+                # Handle numeric values
+                return float(value) if value.replace('.', '').isdigit() else value
+            except:
+                return value
+                
         # Sort items
-        items.sort(reverse=self.stats_tree.heading(column).get("reverse", False))
+        items.sort(key=lambda x: convert_value(x[0]), reverse=self._sort_reverse)
         
         # Rearrange items in sorted positions
         for index, (_, item) in enumerate(items):
             self.stats_tree.move(item, "", index)
         
-        # Reverse sort next time
-        self.stats_tree.heading(column, 
-                              command=lambda: self._sort_stats(column),
-                              reverse=not self.stats_tree.heading(column).get("reverse", False))
+        # Update the heading text to show sort direction
+        for col in self.stats_tree["columns"]:
+            if col == column:
+                direction = " ▼" if self._sort_reverse else " ▲"
+                self.stats_tree.heading(col, text=col + direction)
+            else:
+                # Remove sort indicator from other columns
+                self.stats_tree.heading(col, text=col.rstrip(" ▼▲"))
 
     def _start_battle(self):
         """Start a new battle"""
@@ -2766,6 +3054,11 @@ and Chickenbone's modifications.
     def _start_actual_battle(self):
         """Start the actual battle with prepared info"""
         try:
+            # Check if battle is already running
+            if self.battle_monitor:
+                print("Battle already in progress, skipping start")
+                return
+
             if not hasattr(self, 'prepared_battle_info') or not self.prepared_battle_info:
                 print("No battle info available")
                 return
@@ -2778,11 +3071,17 @@ and Chickenbone's modifications.
                     pass
                 self.preview_window = None
 
-            print("Starting actual battle with:", self.prepared_battle_info)
-            self.manager.start_battle(self.prepared_battle_info)
+            # Store battle info and clear prepared info to prevent duplicate starts
+            battle_info = self.prepared_battle_info
+            self.prepared_battle_info = None
+
+            print("Starting actual battle with:", battle_info)
+            self.manager.start_battle(battle_info)
             self.battle_monitor = self.root.after(1000, self._check_battle_result)
+            
         except Exception as e:
             print(f"Error starting actual battle: {e}")
+            traceback.print_exc()
             if self.battle_monitor:
                 self.root.after_cancel(self.battle_monitor)
                 self.battle_monitor = None
@@ -2845,17 +3144,28 @@ and Chickenbone's modifications.
             # Find and terminate MUGEN process
             try:
                 subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
+                time.sleep(0.5)  # Give process time to terminate
             except:
                 pass
 
             # Clean up MugenWatcher
             if self.manager.watcher_process:
-                self.manager.watcher_process.terminate()
-                self.manager.watcher_process = None
+                try:
+                    self.manager.watcher_process.terminate()
+                    time.sleep(0.5)  # Give process time to terminate
+                    self.manager.watcher_process = None
+                except:
+                    pass
 
-            # Clear current battle state
+            # Clear all battle states
             self.manager.current_battle = None
             self.prepared_battle_info = None
+            self.manager.battle_start_time = None
+            
+            # Reset Twitch betting state
+            if self.twitch_bot:
+                self.twitch_bot.betting_active = False
+                self.twitch_bot.current_bets = {"1": {}, "2": {}}
 
             # Log battle stop
             timestamp = time.strftime("%H:%M:%S")
@@ -2864,7 +3174,12 @@ and Chickenbone's modifications.
                 self.battle_log.see(tk.END)
 
         except Exception as e:
-            print(f"Failed to stop battle: {str(e)}")  # Debug print
+            print(f"Failed to stop battle: {str(e)}")
+            traceback.print_exc()  # Add stack trace for debugging
+            # Try emergency cleanup
+            self.manager.current_battle = None
+            self.prepared_battle_info = None
+            self.battle_monitor = None
 
     def update_twitch_status(self, connected: bool):
         """Update Twitch connection status in GUI"""
@@ -3037,7 +3352,7 @@ and Chickenbone's modifications.
             self.root.after(0, self.update_twitch_status, False)
 
     def _check_battle_result(self):
-        """Check battle result and handle updates"""
+        """Check battle result and handle updates with automatic recovery"""
         try:
             # Check if MUGEN is still running
             mugen_running = self.manager._check_mugen_running()
@@ -3054,10 +3369,9 @@ and Chickenbone's modifications.
                     self._handle_battle_result(result)
                 else:
                     print("No final result available")
-                    # Clear battle state
-                    self.prepared_battle_info = None
-                    self.manager.current_battle = None
-                    
+                    # Try to recover from failed battle
+                    self._handle_failed_battle()
+                
                 self.battle_monitor = None
                 return
             
@@ -3075,8 +3389,128 @@ and Chickenbone's modifications.
         except Exception as e:
             print(f"Error checking battle result: {e}")
             traceback.print_exc()
+            # Try to recover from error
+            self._handle_failed_battle()
             if self.battle_monitor is not None:
                 self.battle_monitor = self.root.after(1000, self._check_battle_result)
+
+    def _handle_failed_battle(self):
+        """Handle and recover from failed battles"""
+        try:
+            timestamp = time.strftime("%H:%M:%S")
+            self.battle_log.insert(tk.END, f"[{timestamp}] Battle failed - attempting recovery\n")
+            self.battle_log.see(tk.END)
+            
+            # Stop any existing processes
+            self.stop_battle()
+            
+            # Clear battle states
+            self.manager.current_battle = None
+            self.prepared_battle_info = None
+            self.battle_monitor = None
+            
+            # Reset Twitch betting if active
+            if self.twitch_bot and self.twitch_bot.betting_active:
+                asyncio.run_coroutine_threadsafe(
+                    self.twitch_bot.end_poll(),
+                    self.twitch_bot.loop
+                )
+            
+            # If in continuous mode, try to start next battle
+            if self.continuous_var.get():
+                self.battle_log.insert(tk.END, f"[{timestamp}] Attempting to start next battle\n")
+                self.battle_log.see(tk.END)
+                self.root.after(2000, self._prepare_next_battle)  # Wait 2 seconds before next battle
+                
+        except Exception as e:
+            print(f"Error in handle_failed_battle: {e}")
+            traceback.print_exc()
+
+    def _prepare_next_battle(self):
+        """Prepare and set up the next battle with error handling"""
+        try:
+            # Check if we already have a prepared battle
+            if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
+                print("Battle already prepared, skipping preparation")
+                return
+
+            # Verify manager state
+            if not self.manager or not hasattr(self.manager, 'prepare_battle'):
+                raise RuntimeError("Battle manager not properly initialized")
+
+            # Verify we have enabled characters and stages
+            if not self.manager.settings["enabled_characters"]:
+                raise ValueError("No characters are enabled")
+            if not self.manager.settings["enabled_stages"]:
+                raise ValueError("No stages are enabled")
+
+            # Prepare next battle
+            self.prepared_battle_info = self.manager.prepare_battle()
+            print("Preparing next battle:", self.prepared_battle_info)
+            
+            if self.twitch_bot and self.twitch_bot.connected:
+                # Show preview and start betting for next battle
+                self.show_battle_preview(self.prepared_battle_info)
+                
+                if self.prepared_battle_info['mode'] == "single":
+                    title = f"{self.prepared_battle_info['p1']} vs {self.prepared_battle_info['p2']}"
+                    option1 = self.prepared_battle_info['p1']
+                    option2 = self.prepared_battle_info['p2']
+                else:
+                    title = "Team Battle"
+                    option1 = " & ".join(self.prepared_battle_info['p1'])
+                    option2 = " & ".join(self.prepared_battle_info['p2'])
+                
+                # Create poll with retry mechanism
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        poll_created = asyncio.run_coroutine_threadsafe(
+                            self.twitch_bot.create_battle_poll(title, option1, option2, self.betting_duration),
+                            self.twitch_bot.loop
+                        ).result(timeout=5)
+                        
+                        if poll_created:
+                            # Start betting timer
+                            self._update_betting_timer(self.betting_duration)
+                            break
+                        elif attempt < max_retries - 1:
+                            print(f"Failed to create poll, retrying ({attempt + 1}/{max_retries})")
+                            time.sleep(1)
+                        else:
+                            print("Failed to create poll after all retries")
+                            self._start_actual_battle()  # Start battle without betting
+                    except Exception as e:
+                        print(f"Error creating poll (attempt {attempt + 1}): {e}")
+                        if attempt == max_retries - 1:
+                            self._start_actual_battle()  # Start battle without betting
+            else:
+                # Start next battle immediately
+                self._start_actual_battle()
+                
+        except Exception as e:
+            print(f"Error preparing next battle: {e}")
+            traceback.print_exc()
+            # Log error
+            timestamp = time.strftime("%H:%M:%S")
+            if hasattr(self, 'battle_log'):
+                self.battle_log.insert(tk.END, f"[{timestamp}] Failed to prepare next battle: {str(e)}\n")
+                self.battle_log.see(tk.END)
+            # Clear the prepared battle info in case of error
+            self.prepared_battle_info = None
+            # Try again in 5 seconds if continuous mode is on
+            if self.continuous_var.get():
+                self.root.after(5000, self._prepare_next_battle)
+
+    def show_battle_preview(self, battle_info):
+        """Show battle preview in tab"""
+        try:
+            # Update the preview tab
+            self._update_preview_tab(battle_info)
+            
+        except Exception as e:
+            print(f"Error updating preview tab: {e}")
+            traceback.print_exc()
 
     def _handle_battle_result(self, result):
         """Handle the battle result and prepare next battle if needed"""
@@ -3095,21 +3529,46 @@ and Chickenbone's modifications.
                         ),
                         self.twitch_bot.loop
                     )
-                    # Wait for the result to be processed
+                    # Wait for the result to be processed with timeout
                     try:
                         future.result(timeout=10)  # Wait up to 10 seconds
+                    except asyncio.TimeoutError:
+                        print("Timeout while processing battle result")
                     except Exception as e:
                         print(f"Error processing battle result: {e}")
                         traceback.print_exc()
             
             # Format and display result
-            self._display_battle_result(result)
+            timestamp = time.strftime("%H:%M:%S")
+            if result.get("mode") == "single":
+                result_text = (
+                    f"[{timestamp}] Battle Result:\n"
+                    f"{result['winner']} defeated {result['loser']}\n"
+                    f"Score: {result['p1_score']}-{result['p2_score']}\n"
+                )
+            else:
+                winner_team = " & ".join(result['winner'])
+                loser_team = " & ".join(result['loser'])
+                result_text = (
+                    f"[{timestamp}] Battle Result:\n"
+                    f"Team {winner_team} defeated Team {loser_team}\n"
+                    f"Score: {result['p1_score']}-{result['p2_score']}\n"
+                )
+            
+            # Log result to battle log
+            if hasattr(self, 'battle_log'):
+                self.battle_log.insert(tk.END, result_text)
+                self.battle_log.see(tk.END)
+            
+            # Update statistics view if available
+            if hasattr(self, '_update_stats_view'):
+                self._update_stats_view()
             
             # Clear current battle state
             self.prepared_battle_info = None
             self.manager.current_battle = None
             
-            # If continuous mode, prepare next battle
+            # If continuous mode is enabled, prepare next battle
             if hasattr(self, 'continuous_var') and self.continuous_var.get():
                 # Add a small delay before preparing next battle
                 self.root.after(1000, self._prepare_next_battle)
@@ -3119,79 +3578,62 @@ and Chickenbone's modifications.
         except Exception as e:
             print(f"Error handling battle result: {e}")
             traceback.print_exc()
-
-    def _display_battle_result(self, result):
-        """Display the battle result in the battle log"""
-        try:
-            timestamp = time.strftime("%H:%M:%S")
-            if result.get("mode") == "single":
-                result_text = f"[{timestamp}] Battle Result:\n{result['winner']} defeated {result['loser']}\nScore: {result['p1_score']}-{result['p2_score']}\n"
-            else:
-                winner_team = " & ".join(result['winner'])
-                loser_team = " & ".join(result['loser'])
-                result_text = f"[{timestamp}] Battle Result:\nTeam {winner_team} defeated Team {loser_team}\nScore: {result['p1_score']}-{result['p2_score']}\n"
-            
-            if hasattr(self, 'battle_log'):
-                self.battle_log.insert(tk.END, result_text)
-                self.battle_log.see(tk.END)
-            
-            # Update statistics view if available
-            if hasattr(self, '_update_stats_view'):
-                self._update_stats_view()
-                
-        except Exception as e:
-            print(f"Error displaying battle result: {e}")
-            
-    def _prepare_next_battle(self):
-        """Prepare and set up the next battle"""
-        try:
-            # Check if we already have a prepared battle
-            if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
-                print("Battle already prepared, skipping preparation")
-                return
-
-            # Prepare next battle
-            self.prepared_battle_info = self.manager.prepare_battle()
-            print("Preparing next battle:", self.prepared_battle_info)
-            
-            if self.twitch_bot:
-                # Show preview and start betting for next battle
-                self.show_battle_preview(self.prepared_battle_info)
-                
-                if self.prepared_battle_info['mode'] == "single":
-                    title = f"{self.prepared_battle_info['p1']} vs {self.prepared_battle_info['p2']}"
-                    option1 = self.prepared_battle_info['p1']
-                    option2 = self.prepared_battle_info['p2']
-                else:
-                    title = "Team Battle"
-                    option1 = " & ".join(self.prepared_battle_info['p1'])
-                    option2 = " & ".join(self.prepared_battle_info['p2'])
-                
-                asyncio.run_coroutine_threadsafe(
-                    self.twitch_bot.create_battle_poll(title, option1, option2, self.betting_duration),
-                    self.twitch_bot.loop
-                )
-                
-                # Start betting timer
-                self._update_betting_timer(self.betting_duration)
-            else:
-                # Start next battle immediately
-                self._start_actual_battle()
-                
-        except Exception as e:
-            print(f"Error preparing next battle: {e}")
-            traceback.print_exc()
-            # Clear the prepared battle info in case of error
+            # Try to recover
+            self._handle_failed_battle()
+            # Clear states
             self.prepared_battle_info = None
+            self.manager.current_battle = None
+            self.battle_monitor = None
 
-    def show_battle_preview(self, battle_info):
-        """Show battle preview in tab"""
+    def _monitor_memory_usage(self):
+        """Monitor memory usage and clean up if necessary"""
         try:
-            # Update the preview tab
-            self._update_preview_tab(battle_info)
+            process = psutil.Process()
+            memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
+            
+            # Log high memory usage
+            if memory_usage > 500:  # Warning at 500MB
+                print(f"Warning: High memory usage detected: {memory_usage:.2f}MB")
+                
+            # Force cleanup at critical levels
+            if memory_usage > 1000:  # Critical at 1GB
+                print(f"Critical: Memory usage too high ({memory_usage:.2f}MB). Initiating cleanup...")
+                self.stop_battle()  # Stop current battle
+                self._force_cleanup()  # Additional cleanup
+                
+            # Schedule next check
+            self.root.after(30000, self._monitor_memory_usage)  # Check every 30 seconds
             
         except Exception as e:
-            print(f"Error updating preview tab: {e}")
+            print(f"Error monitoring memory: {e}")
+            traceback.print_exc()
+    
+    def _force_cleanup(self):
+        """Force cleanup of resources when memory usage is critical"""
+        try:
+            # Clear GUI elements
+            if hasattr(self, 'battle_log'):
+                self.battle_log.delete('1.0', tk.END)
+            
+            # Reset all battle states
+            self.manager.current_battle = None
+            self.prepared_battle_info = None
+            self.battle_monitor = None
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Kill any hanging processes
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    if proc.name().lower() in ['mugen.exe', 'mugenwatcher.exe']:
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                    
+        except Exception as e:
+            print(f"Error during force cleanup: {e}")
             traceback.print_exc()
 
 if __name__ == "__main__":
