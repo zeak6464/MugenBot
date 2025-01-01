@@ -1297,19 +1297,23 @@ class TwitchBot(commands.Bot):
 class BattleGUI:
     def __init__(self, manager):
         """Initialize the GUI with the given battle manager"""
-        super().__init__()
-        
         self.manager = manager
         
-        # Initialize variables
+        # Create root window first
+        self.root = tk.Tk()
+        self.root.title("MUGEN Random AI Battles")
+        self.root.geometry("1024x768")
+        
+        # Set window icon if available
+        icon_path = Path("icon.ico")
+        if icon_path.exists():
+            self.root.iconbitmap(str(icon_path))
+
+        # Initialize variables after root window is created
         self.mode_var = tk.StringVar(value="single")
         self.rounds_var = tk.StringVar(value="1")
-        # Remove time_var since it's not supported by MUGEN command line
         self.continuous_var = tk.BooleanVar(value=False)
         self.random_color_var = tk.BooleanVar(value=True)
-        
-        self.setup_main_window()
-        self.load_theme()
         
         # Initialize battle settings variables
         self.team_size_var = tk.IntVar(value=3)
@@ -1336,7 +1340,10 @@ class BattleGUI:
         self.twitch_status_label = None
         
         # Setup GUI components
+        self.load_theme()
+        self.create_menu()
         self.setup_gui()
+        
         self.battle_monitor = None
         self.current_theme = "light"
         self.executor = ThreadPoolExecutor(max_workers=1)
@@ -1350,6 +1357,16 @@ class BattleGUI:
                 self.load_config_data(config)
             except Exception as e:
                 print(f"Failed to load default config: {e}")
+
+        # Bind keyboard shortcuts
+        self.root.bind('<F5>', lambda e: self._start_battle())          # Start battle
+        self.root.bind('<F6>', lambda e: self.stop_battle())           # Stop battle
+        self.root.bind('<F7>', lambda e: self._quick_rematch())         # Quick rematch
+        self.root.bind('<F8>', lambda e: self._force_next_round())      # Force next round
+        self.root.bind('<F9>', lambda e: self._reset_battle_scores())   # Reset scores
+        self.root.bind('<F10>', lambda e: self._change_random_stage())  # Random stage
+        self.root.bind('<F11>', lambda e: self._start_battle_after_betting())  # Force start
+        self.root.bind('<F12>', lambda e: self._toggle_ai_level())      # Toggle AI level
 
     def _create_placeholder_portrait(self):
         """Create a placeholder portrait image"""
@@ -1394,29 +1411,6 @@ class BattleGUI:
         draw.text((240, 135), "Stage Preview Not Available", font=font, fill='#CCCCCC', anchor='ms')
         
         return ImageTk.PhotoImage(img)
-
-    def setup_main_window(self):
-        self.root = tk.Tk()
-        self.root.title("MUGEN Random AI Battles")
-        self.root.geometry("1024x768")
-        
-        # Set window icon if available
-        icon_path = Path("icon.ico")
-        if icon_path.exists():
-            self.root.iconbitmap(str(icon_path))
-
-        # Bind keyboard shortcuts
-        self.root.bind('<F5>', lambda e: self._start_battle())          # Start battle
-        self.root.bind('<F6>', lambda e: self.stop_battle())           # Stop battle
-        self.root.bind('<F7>', lambda e: self._quick_rematch())         # Quick rematch
-        self.root.bind('<F8>', lambda e: self._force_next_round())      # Force next round
-        self.root.bind('<F9>', lambda e: self._reset_battle_scores())   # Reset scores
-        self.root.bind('<F10>', lambda e: self._change_random_stage())  # Random stage
-        self.root.bind('<F11>', lambda e: self._start_battle_after_betting())  # Force start
-        self.root.bind('<F12>', lambda e: self._toggle_ai_level())      # Toggle AI level
-
-        # Create menu bar
-        self.create_menu()
 
     def load_theme(self):
         """Load custom theme colors"""
@@ -1504,27 +1498,29 @@ class BattleGUI:
         self.notebook = ttk.Notebook(self.main_container)
         self.notebook.pack(expand=True, fill="both")
 
-        # Create tabs
+        # Create all tabs first
+        self.battle_tab = ttk.Frame(self.notebook)
         self.characters_tab = ttk.Frame(self.notebook)
         self.stages_tab = ttk.Frame(self.notebook)
         self.stats_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
-        self.preview_tab = ttk.Frame(self.notebook)  # New preview tab
+        self.preview_tab = ttk.Frame(self.notebook)
 
-        # Setup each tab
-        self._setup_battle_tab()
+        # Add tabs to notebook
+        self.notebook.add(self.battle_tab, text="Battle")
         self.notebook.add(self.characters_tab, text="Characters")
         self.notebook.add(self.stages_tab, text="Stages")
         self.notebook.add(self.stats_tab, text="Statistics")
         self.notebook.add(self.settings_tab, text="Settings")
-        self.notebook.add(self.preview_tab, text="Battle Preview")  # Add preview tab
+        self.notebook.add(self.preview_tab, text="Battle Preview")
 
-        # Setup other tabs
+        # Setup each tab
+        self._setup_battle_tab()
         self._setup_characters_tab()
         self._setup_stages_tab()
         self._setup_stats_tab()
         self._setup_settings_tab()
-        self._setup_preview_tab()  # Setup the new preview tab
+        self._setup_preview_tab()
 
     def _setup_preview_tab(self):
         """Setup the battle preview tab"""
@@ -1970,32 +1966,15 @@ class BattleGUI:
         control_frame = ttk.LabelFrame(battle_frame, text="Battle Controls")
         control_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Settings row (mode, rounds)
-        settings_frame = ttk.Frame(control_frame)
-        settings_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Create three columns for controls
+        left_frame = ttk.Frame(control_frame)
+        left_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
 
-        # Mode selection
-        mode_label = ttk.Label(settings_frame, text="Mode:")
-        mode_label.grid(row=0, column=0, padx=5)
-        
-        mode_combo = ttk.Combobox(settings_frame, textvariable=self.mode_var, 
-                                 values=["single", "simul", "turns", "tag"],
-                                 state="readonly", width=10)
-        mode_combo.grid(row=0, column=1, padx=5)
-        
-        # Rounds spinbox
-        rounds_label = ttk.Label(settings_frame, text="Rounds:")
-        rounds_label.grid(row=0, column=2, padx=5)
-        
-        rounds_spinbox = ttk.Spinbox(settings_frame, from_=1, to=99,
-                                    textvariable=self.rounds_var, width=5)
-        rounds_spinbox.grid(row=0, column=3, padx=5)
+        middle_frame = ttk.Frame(control_frame)
+        middle_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
 
-        # Remove time spinbox and label since time must be configured in MUGEN's config files
-
-        # Checkboxes row
-        checkbox_frame = ttk.Frame(control_frame)
-        checkbox_frame.pack(fill=tk.X, padx=5, pady=5)
+        right_frame = ttk.Frame(control_frame)
+        right_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
 
         # Left column - Main Controls
         ttk.Label(left_frame, text="Main Controls", font=("Segoe UI", 10, "bold")).pack(pady=5)
@@ -2084,44 +2063,32 @@ class BattleGUI:
 
         # Row 1: Rounds and Time settings
         ttk.Label(settings_grid, text="Rounds:").grid(row=0, column=0, padx=5)
-        self.rounds_var = tk.IntVar(value=1)
-        ttk.Spinbox(
+        rounds_spinbox = ttk.Spinbox(
             settings_grid,
             from_=1,
             to=9,
             width=5,
             textvariable=self.rounds_var,
             command=self._update_manager_settings
-        ).grid(row=0, column=1, padx=5)
-
-        ttk.Label(settings_grid, text="Time:").grid(row=0, column=2, padx=5)
-        self.time_var = tk.StringVar(value="99")
-        time_spinbox = ttk.Spinbox(
-            settings_grid,
-            values=["30", "60", "99", "120", "180", "240", "300", "∞"],
-            width=5,
-            textvariable=self.time_var,
-            command=self._update_manager_settings
         )
-        time_spinbox.grid(row=0, column=3, padx=5)
+        rounds_spinbox.grid(row=0, column=1, padx=5)
 
         # Row 2: Team Size (for simul mode)
         ttk.Label(settings_grid, text="Team Size:").grid(row=1, column=0, padx=5)
-        self.team_size_var = tk.IntVar(value=2)
-        ttk.Spinbox(
+        team_size_spinbox = ttk.Spinbox(
             settings_grid,
             from_=1,
             to=2,
             width=5,
             textvariable=self.team_size_var,
             command=self._update_manager_settings
-        ).grid(row=1, column=1, padx=5)
+        )
+        team_size_spinbox.grid(row=1, column=1, padx=5)
 
         # Row 3: Checkboxes
         options_frame = ttk.Frame(settings_frame)
         options_frame.pack(fill="x", padx=5, pady=5)
 
-        self.continuous_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             options_frame,
             text="🔁 Continuous Mode",
@@ -2129,7 +2096,6 @@ class BattleGUI:
             command=self._update_manager_settings
         ).pack(side="left", padx=10)
 
-        self.random_color_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options_frame,
             text="🎨 Random Colors",
@@ -3741,5 +3707,6 @@ and Chickenbone's modifications.
             traceback.print_exc()
 
 if __name__ == "__main__":
-    gui = BattleGUI()
+    manager = MugenBattleManager()
+    gui = BattleGUI(manager)
     gui.run() 
