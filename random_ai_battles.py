@@ -91,11 +91,15 @@ class MugenBattleManager:
     def scan_stages(self):
         """Scan for available stages"""
         stages = []
-        stages_path = Path("stages")
+        stages_path = Path("stages")  # Root stages folder
         if stages_path.exists():
-            # Scan for .def files directly in stages directory
-            for stage_file in stages_path.glob("*.def"):
-                stage_name = stage_file.stem  # Get filename without extension
+            # Scan for .def files directly in stages directory and subdirectories
+            for stage_file in stages_path.glob("**/*.def"):
+                # Get the stage name without path or extension
+                stage_name = stage_file.stem
+                # For stages in subdirectories, include the subdirectory name
+                if stage_file.parent != stages_path:
+                    stage_name = f"{stage_file.parent.name}/{stage_name}"
                 stages.append(stage_name)
         
         print("Found stages:", stages)  # Debug print
@@ -318,20 +322,18 @@ class MugenBattleManager:
         
         print("Starting battle with:", battle_info)
 
-        # Handle infinite time setting
-        time_setting = self.settings.get("time", "99")
-        if time_setting == "∞":
-            time_setting = "0"  # MUGEN uses 0 for infinite time
-
+        # Note: Round time must be configured in MUGEN's system.def or fight.def files
+        # Command line time parameter is not supported by MUGEN
+        
         # Base command with MUGEN path and rounds
         cmd = [
             str(self.mugen_path),
-            "-rounds", str(self.settings["rounds"]),
-            "-time", time_setting
+            "-rounds", str(self.settings["rounds"])
         ]
 
         # Add character commands based on battle mode
         if battle_info['mode'] == "single":
+            # Single mode: Each character has 2 rounds
             cmd.extend([
                 "-p1", f"chars/{battle_info['p1']}/{battle_info['p1']}.def",
                 "-p1.ai", "1",
@@ -339,33 +341,57 @@ class MugenBattleManager:
                 "-p2.ai", "1",
                 "-p2.color", str(self.settings["p2_color"])
             ])
-        elif battle_info['mode'] in ["team", "turns", "simul"]:
+        elif battle_info['mode'] == "simul":
+            # Simul mode: Characters fight simultaneously (max 2 per team)
+            # First character of team 1
             cmd.extend([
-                "-p1.teammember", str(self.settings["team_size"]),
+                "-p1", f"chars/{battle_info['p1'][0]}/{battle_info['p1'][0]}.def",
                 "-p1.ai", "1"
             ])
-            # Add team 1 members
-            for char in battle_info['p1']:
-                cmd.extend([f"chars/{char}/{char}.def"])
             
-            # Add team 2 configuration and members
+            # First character of team 2
             cmd.extend([
-                "-p2.teammember", str(self.settings["team_size"]),
+                "-p2", f"chars/{battle_info['p2'][0]}/{battle_info['p2'][0]}.def",
                 "-p2.ai", "1",
                 "-p2.color", str(self.settings["p2_color"])
             ])
-            for char in battle_info['p2']:
-                cmd.extend([f"chars/{char}/{char}.def"])
+            
+            # Additional team 1 members
+            for i, char in enumerate(battle_info['p1'][1:], 3):
+                cmd.extend([
+                    f"-p{i}", f"chars/{char}/{char}.def",
+                    f"-p{i}.ai", "1"
+                ])
+            
+            # Additional team 2 members
+            for i, char in enumerate(battle_info['p2'][1:], 4):
+                cmd.extend([
+                    f"-p{i}", f"chars/{char}/{char}.def",
+                    f"-p{i}.ai", "1",
+                    f"-p{i}.color", str(self.settings["p2_color"])
+                ])
 
-        # Add stage with proper path
-        stage_path = f"stages/{battle_info['stage']}.def"
-        cmd.extend(["-s", stage_path])
+        # Add stage with just the stage name (no path or extension)
+        if battle_info['stage'].startswith('stages/'):
+            stage_name = battle_info['stage'][7:]  # Remove 'stages/' prefix
+        else:
+            stage_name = battle_info['stage']
+        cmd.extend(["-s", stage_name])
 
-        print("Running command:", cmd)
+        # Convert command list to string with proper quoting
+        cmd_str = f'"{cmd[0]}"'  # Quote the executable path
+        for arg in cmd[1:]:
+            # Quote any argument that contains spaces
+            if ' ' in str(arg):
+                cmd_str += f' "{arg}"'
+            else:
+                cmd_str += f' {arg}'
+
+        print("Running command:", cmd_str)
 
         try:
             # Start MUGEN process with timeout handling
-            process = subprocess.Popen(cmd, cwd=str(self.mugen_path.parent))
+            process = subprocess.Popen(cmd_str, shell=True, cwd=str(self.mugen_path.parent))
             
             # Wait up to 5 seconds for process to start
             for _ in range(50):
@@ -394,18 +420,23 @@ class MugenBattleManager:
                     pass
             raise
 
-    def _check_mugen_running(self) -> bool:
-        """Check if MUGEN is still running with timeout"""
+    def _check_mugen_running(self):
+        """Check if any MUGEN process is running"""
         try:
-            # Look for mugen.exe in running processes with timeout
-            process = subprocess.Popen(['tasklist'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                stdout, _ = process.communicate(timeout=3)  # 3 second timeout
-                return "mugen.exe" in stdout.decode().lower()
-            except subprocess.TimeoutExpired:
-                process.kill()
-                return False
-        except:
+            # Check for all possible MUGEN executables
+            mugen_exes = ['mugen.exe', '3v3.exe', '4v4.exe']
+            for exe in mugen_exes:
+                result = subprocess.run(
+                    f'tasklist /FI "IMAGENAME eq {exe}" /NH', 
+                    shell=True, 
+                    capture_output=True, 
+                    text=True
+                )
+                if exe in result.stdout:
+                    return True
+            return False
+        except Exception as e:
+            print(f"Error checking MUGEN process: {e}")
             return False
 
     def check_battle_result(self) -> Optional[Dict]:
@@ -889,10 +920,11 @@ class MugenBattleManager:
         # Select random stage
         stage = random.choice(enabled_stages)
         
-        # Prepare battle info based on mode
-        battle_info = None
+        # Get battle mode from settings
+        battle_mode = self.settings.get("battle_mode", "single")
         
-        if self.settings["battle_mode"] == "single":
+        # Prepare battle info based on mode
+        if battle_mode == "single":
             # Select two different characters
             p1 = random.choice(enabled_chars)
             p2 = random.choice([c for c in enabled_chars if c != p1])
@@ -902,59 +934,29 @@ class MugenBattleManager:
                 "p2": p2,
                 "stage": stage
             }
-        elif self.settings["battle_mode"] == "team":
-            # Select teams
-            team_size = self.settings["team_size"]
+        elif battle_mode == "simul":
+            # For simul mode, limit to 2 players per team maximum
+            team_size = min(2, self.settings.get("team_size", 2))
+            
             if len(enabled_chars) < team_size * 2:
-                raise ValueError(f"Not enough characters for {team_size}v{team_size} team battle!")
+                raise ValueError(f"Not enough characters for {team_size}v{team_size} simul battle!")
             
             team1 = random.sample(enabled_chars, team_size)
             remaining_chars = [c for c in enabled_chars if c not in team1]
             team2 = random.sample(remaining_chars, team_size)
             
-            battle_info = {
-                "mode": "team",
-                "p1": team1,
-                "p2": team2,
-                "stage": stage
-            }
-        elif self.settings["battle_mode"] == "turns":
-            # Select teams for turns battle
-            team_size = self.settings["team_size"]
-            if len(enabled_chars) < team_size * 2:
-                raise ValueError(f"Not enough characters for {team_size}v{team_size} turns battle!")
-            
-            team1 = random.sample(enabled_chars, team_size)
-            remaining_chars = [c for c in enabled_chars if c not in team1]
-            team2 = random.sample(remaining_chars, team_size)
-            
-            battle_info = {
-                "mode": "turns",
-                "p1": team1,
-                "p2": team2,
-                "stage": stage
-            }
-        elif self.settings["battle_mode"] == "simul":
-            team1_size = self.settings.get("team1_size", random.randint(1, 4))
-            team2_size = self.settings.get("team2_size", random.randint(1, 4))
-            total_chars_needed = team1_size + team2_size
-            if len(enabled_chars) < total_chars_needed:
-                raise ValueError(f"Not enough characters for {team1_size}v{team2_size} simul battle!")
-            team1 = random.sample(enabled_chars, team1_size)
-            remaining_chars = [c for c in enabled_chars if c not in team1]
-            team2 = random.sample(remaining_chars, team2_size)
             battle_info = {
                 "mode": "simul",
                 "p1": team1,
                 "p2": team2,
-                "team1_size": team1_size,
-                "team2_size": team2_size,
+                "team1_size": team_size,
+                "team2_size": team_size,
                 "stage": stage
             }
         else:
-            raise ValueError(f"Unknown battle mode: {self.settings['battle_mode']}")
+            raise ValueError(f"Unknown battle mode: {battle_mode}")
 
-        print("Prepared battle info:", battle_info)  # Debug print
+        print("Prepared battle info:", battle_info)
         return battle_info
 
     def get_average_battle_duration(self) -> str:
@@ -1293,10 +1295,27 @@ class TwitchBot(commands.Bot):
             self.betting_active = False
 
 class BattleGUI:
-    def __init__(self):
-        self.manager = MugenBattleManager()
+    def __init__(self, manager):
+        """Initialize the GUI with the given battle manager"""
+        super().__init__()
+        
+        self.manager = manager
+        
+        # Initialize variables
+        self.mode_var = tk.StringVar(value="single")
+        self.rounds_var = tk.StringVar(value="1")
+        # Remove time_var since it's not supported by MUGEN command line
+        self.continuous_var = tk.BooleanVar(value=False)
+        self.random_color_var = tk.BooleanVar(value=True)
+        
         self.setup_main_window()
         self.load_theme()
+        
+        # Initialize battle settings variables
+        self.team_size_var = tk.IntVar(value=3)
+        self.team1_size_var = tk.IntVar(value=2)
+        self.team2_size_var = tk.IntVar(value=2)
+        self.random_team_sizes_var = tk.BooleanVar(value=True)
         
         # Initialize Twitch-related variables
         self.twitch_bot = None
@@ -1943,23 +1962,40 @@ class BattleGUI:
             print(f"Error updating preview tab: {e}")
 
     def _setup_battle_tab(self):
-        """Setup battle control tab"""
-        # Create the battle tab
-        battle_frame = ttk.Frame(self.notebook)
-        self.notebook.add(battle_frame, text="Battle Controls")  # Add it to notebook
+        """Setup the battle tab with all controls"""
+        battle_frame = ttk.Frame(self.battle_tab)
+        battle_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Top control panel with three sections
-        control_panel = ttk.LabelFrame(battle_frame, text="Battle Controls")
-        control_panel.pack(fill="x", padx=10, pady=5)
+        # Top control panel
+        control_frame = ttk.LabelFrame(battle_frame, text="Battle Controls")
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Create three columns for better organization
-        left_frame = ttk.Frame(control_panel)
-        middle_frame = ttk.Frame(control_panel)
-        right_frame = ttk.Frame(control_panel)
+        # Settings row (mode, rounds)
+        settings_frame = ttk.Frame(control_frame)
+        settings_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Mode selection
+        mode_label = ttk.Label(settings_frame, text="Mode:")
+        mode_label.grid(row=0, column=0, padx=5)
         
-        left_frame.pack(side="left", expand=True, fill="both", padx=5, pady=5)
-        middle_frame.pack(side="left", expand=True, fill="both", padx=5, pady=5)
-        right_frame.pack(side="left", expand=True, fill="both", padx=5, pady=5)
+        mode_combo = ttk.Combobox(settings_frame, textvariable=self.mode_var, 
+                                 values=["single", "simul", "turns", "tag"],
+                                 state="readonly", width=10)
+        mode_combo.grid(row=0, column=1, padx=5)
+        
+        # Rounds spinbox
+        rounds_label = ttk.Label(settings_frame, text="Rounds:")
+        rounds_label.grid(row=0, column=2, padx=5)
+        
+        rounds_spinbox = ttk.Spinbox(settings_frame, from_=1, to=99,
+                                    textvariable=self.rounds_var, width=5)
+        rounds_spinbox.grid(row=0, column=3, padx=5)
+
+        # Remove time spinbox and label since time must be configured in MUGEN's config files
+
+        # Checkboxes row
+        checkbox_frame = ttk.Frame(control_frame)
+        checkbox_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # Left column - Main Controls
         ttk.Label(left_frame, text="Main Controls", font=("Segoe UI", 10, "bold")).pack(pady=5)
@@ -2026,8 +2062,6 @@ class BattleGUI:
         self.mode_var = tk.StringVar(value="single")
         modes = [
             ("👤 Single Battle", "single"),
-            ("👥 Team Battle", "team"),
-            ("🔄 Turns Battle", "turns"),
             ("⚔ Simul Battle", "simul")
         ]
         
@@ -2036,7 +2070,8 @@ class BattleGUI:
                 mode_frame,
                 text=text,
                 value=mode,
-                variable=self.mode_var
+                variable=self.mode_var,
+                command=self._update_manager_settings
             ).pack(side="left", padx=10, pady=5)
 
         # Battle Settings with better organization
@@ -2055,48 +2090,86 @@ class BattleGUI:
             from_=1,
             to=9,
             width=5,
-            textvariable=self.rounds_var
+            textvariable=self.rounds_var,
+            command=self._update_manager_settings
         ).grid(row=0, column=1, padx=5)
 
         ttk.Label(settings_grid, text="Time:").grid(row=0, column=2, padx=5)
-        self.time_var = tk.IntVar(value=180)  # Updated to match MUGEN's default time
+        self.time_var = tk.StringVar(value="99")
         time_spinbox = ttk.Spinbox(
             settings_grid,
-            from_=30,
-            to=999,
+            values=["30", "60", "99", "120", "180", "240", "300", "∞"],
             width=5,
-            textvariable=self.time_var
+            textvariable=self.time_var,
+            command=self._update_manager_settings
         )
         time_spinbox.grid(row=0, column=3, padx=5)
 
-        # Row 2: Checkboxes
+        # Row 2: Team Size (for simul mode)
+        ttk.Label(settings_grid, text="Team Size:").grid(row=1, column=0, padx=5)
+        self.team_size_var = tk.IntVar(value=2)
+        ttk.Spinbox(
+            settings_grid,
+            from_=1,
+            to=2,
+            width=5,
+            textvariable=self.team_size_var,
+            command=self._update_manager_settings
+        ).grid(row=1, column=1, padx=5)
+
+        # Row 3: Checkboxes
+        options_frame = ttk.Frame(settings_frame)
+        options_frame.pack(fill="x", padx=5, pady=5)
+
         self.continuous_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            settings_grid,
+            options_frame,
             text="🔁 Continuous Mode",
-            variable=self.continuous_var
-        ).grid(row=1, column=0, columnspan=2, padx=10, pady=5)
+            variable=self.continuous_var,
+            command=self._update_manager_settings
+        ).pack(side="left", padx=10)
 
         self.random_color_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            settings_grid,
+            options_frame,
             text="🎨 Random Colors",
-            variable=self.random_color_var
-        ).grid(row=1, column=2, columnspan=2, padx=10, pady=5)
+            variable=self.random_color_var,
+            command=self._update_manager_settings
+        ).pack(side="left", padx=10)
 
-        # Battle Log with title and clear button
+        # Battle Log Frame
         log_frame = ttk.LabelFrame(battle_frame, text="Battle Log")
-        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        log_frame.pack(expand=True, fill="both", padx=10, pady=5)
 
-        # Add clear log button
-        ttk.Button(
-            log_frame,
-            text="Clear Log",
-            command=lambda: self.battle_log.delete(1.0, tk.END)
-        ).pack(side="top", anchor="e", padx=5, pady=2)
+        # Create and configure the battle log text widget
+        self.battle_log = tk.Text(log_frame, height=10, wrap=tk.WORD)
+        self.battle_log.pack(side="left", expand=True, fill="both", padx=5, pady=5)
+        
+        # Add scrollbar for battle log
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.battle_log.yview)
+        log_scrollbar.pack(side="right", fill="y")
+        self.battle_log.configure(yscrollcommand=log_scrollbar.set)
 
-        self.battle_log = ScrolledText(log_frame, height=10)
-        self.battle_log.pack(fill="both", expand=True, padx=5, pady=5)
+        # Initialize settings
+        self._update_manager_settings()
+
+    def _update_manager_settings(self, *args):
+        """Update the manager's settings based on GUI controls"""
+        try:
+            self.manager.settings.update({
+                "battle_mode": self.mode_var.get(),
+                "rounds": self.rounds_var.get(),
+                "continuous_mode": self.continuous_var.get(),
+                "random_color": self.random_color_var.get(),
+                "team_size": self.team_size_var.get(),
+                "team1_size": self.team1_size_var.get(),
+                "team2_size": self.team2_size_var.get(),
+                "random_team_sizes": self.random_team_sizes_var.get()
+            })
+            print("Updated manager settings:", self.manager.settings)  # Debug print
+        except Exception as e:
+            print(f"Error updating manager settings: {e}")
+            traceback.print_exc()
 
     def _setup_characters_tab(self):
         # Create search and filter frame
@@ -3017,16 +3090,22 @@ and Chickenbone's modifications.
 
             # Clear any existing battle state
             self.stop_battle()
+            time.sleep(0.5)  # Give time for cleanup
 
             # Prepare the battle info
-            self.prepared_battle_info = self.manager.prepare_battle()
-            print("Prepared battle info:", self.prepared_battle_info)
+            try:
+                self.prepared_battle_info = self.manager.prepare_battle()
+                print("Prepared battle info:", self.prepared_battle_info)
+            except Exception as e:
+                print(f"Error preparing battle: {e}")
+                traceback.print_exc()
+                return
 
             # Show battle preview and start betting period
             self.show_battle_preview(self.prepared_battle_info)
             
             # If Twitch bot is connected, create poll
-            if self.twitch_bot:
+            if self.twitch_bot and self.twitch_bot.connected:
                 if self.prepared_battle_info['mode'] == "single":
                     title = f"{self.prepared_battle_info['p1']} vs {self.prepared_battle_info['p2']}"
                     option1 = self.prepared_battle_info['p1']
@@ -3036,20 +3115,28 @@ and Chickenbone's modifications.
                     option1 = " & ".join(self.prepared_battle_info['p1'])
                     option2 = " & ".join(self.prepared_battle_info['p2'])
                 
-                asyncio.run_coroutine_threadsafe(
-                    self.twitch_bot.create_battle_poll(title, option1, option2, self.betting_duration),
-                    self.twitch_bot.loop
-                )
-                
-                # Start the betting timer
-                self._update_betting_timer(self.betting_duration)
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.twitch_bot.create_battle_poll(title, option1, option2, self.betting_duration),
+                        self.twitch_bot.loop
+                    )
+                    # Start the betting timer
+                    self._update_betting_timer(self.betting_duration)
+                except Exception as e:
+                    print(f"Error creating Twitch poll: {e}")
+                    traceback.print_exc()
+                    # Start battle without betting if poll creation fails
+                    self._start_actual_battle()
             else:
                 # If no Twitch bot, start battle immediately
                 self._start_actual_battle()
 
         except Exception as e:
-            print(f"Failed to start battle: {str(e)}")  # Debug print
+            print(f"Failed to start battle: {str(e)}")
+            traceback.print_exc()
             self.battle_monitor = None  # Reset battle monitor on error
+            # Try to clean up
+            self.stop_battle()
 
     def _start_actual_battle(self):
         """Start the actual battle with prepared info"""
@@ -3371,6 +3458,9 @@ and Chickenbone's modifications.
                     print("No final result available")
                     # Try to recover from failed battle
                     self._handle_failed_battle()
+                    # If continuous mode is on, prepare next battle
+                    if self.continuous_var.get():
+                        self.root.after(2000, self._prepare_next_battle)
                 
                 self.battle_monitor = None
                 return
@@ -3380,6 +3470,7 @@ and Chickenbone's modifications.
             if result:
                 print(f"Battle result received during battle: {result}")
                 self._handle_battle_result(result)
+                self.battle_monitor = None
                 return
             
             # Continue monitoring if no result yet
@@ -3391,13 +3482,26 @@ and Chickenbone's modifications.
             traceback.print_exc()
             # Try to recover from error
             self._handle_failed_battle()
-            if self.battle_monitor is not None:
-                self.battle_monitor = self.root.after(1000, self._check_battle_result)
+            # If continuous mode is on, prepare next battle
+            if hasattr(self, 'continuous_var') and self.continuous_var.get():
+                self.root.after(2000, self._prepare_next_battle)
+            self.battle_monitor = None
 
     def _handle_failed_battle(self):
         """Handle and recover from failed battles"""
         try:
             timestamp = time.strftime("%H:%M:%S")
+            # Check if battle_log exists and create it if it doesn't
+            if not hasattr(self, 'battle_log') or not self.battle_log:
+                print("Warning: battle_log not initialized, creating it now")
+                log_frame = ttk.LabelFrame(self.battle_tab, text="Battle Log")
+                log_frame.pack(expand=True, fill="both", padx=10, pady=5)
+                self.battle_log = tk.Text(log_frame, height=10, wrap=tk.WORD)
+                self.battle_log.pack(side="left", expand=True, fill="both", padx=5, pady=5)
+                log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.battle_log.yview)
+                log_scrollbar.pack(side="right", fill="y")
+                self.battle_log.configure(yscrollcommand=log_scrollbar.set)
+            
             self.battle_log.insert(tk.END, f"[{timestamp}] Battle failed - attempting recovery\n")
             self.battle_log.see(tk.END)
             
