@@ -2944,33 +2944,62 @@ and Chickenbone's modifications.
             self.stats_tree.delete(item)
         
         # Update summary statistics
-        total_battles = sum(
-            stats["wins"] + stats["losses"]
-            for stats in self.manager.character_stats.values()
-        )
+        total_battles = 0
+        for stats in self.manager.character_stats.values():
+            if isinstance(stats, dict):
+                total_battles += stats.get("wins", 0) + stats.get("losses", 0)
+            elif isinstance(stats, list) and len(stats) >= 2:
+                total_battles += stats[0] + stats[1]  # Assuming [wins, losses]
         self.summary_labels["total_battles"].config(text=str(total_battles))
         
         # Find top winner
         if self.manager.character_stats:
-            top_winner = max(
-                self.manager.character_stats.items(),
-                key=lambda x: x[1]["wins"]
-            )[0]
-            self.summary_labels["top_winner"].config(text=top_winner)
+            try:
+                def get_wins(stats):
+                    if isinstance(stats, dict):
+                        return stats.get("wins", 0)
+                    elif isinstance(stats, list) and len(stats) >= 1:
+                        return stats[0]  # Assuming [wins, losses]
+                    return 0
+
+                top_winner = max(
+                    self.manager.character_stats.items(),
+                    key=lambda x: get_wins(x[1])
+                )[0]
+                self.summary_labels["top_winner"].config(text=top_winner)
+            except Exception as e:
+                print(f"Error finding top winner: {e}")
+                self.summary_labels["top_winner"].config(text="N/A")
         
         # Find most used stage
         if self.manager.stage_stats:
-            top_stage = max(
-                self.manager.stage_stats.items(),
-                key=lambda x: x[1]["times_used"]
-            )[0]
-            self.summary_labels["top_stage"].config(text=top_stage)
+            try:
+                top_stage = max(
+                    self.manager.stage_stats.items(),
+                    key=lambda x: x[1].get("times_used", 0)
+                )[0]
+                self.summary_labels["top_stage"].config(text=top_stage)
+            except Exception as e:
+                print(f"Error finding top stage: {e}")
+                self.summary_labels["top_stage"].config(text="N/A")
         
         # Add character statistics
         for char in sorted(self.manager.characters):
-            stats = self.manager.character_stats.get(char, {"wins": 0, "losses": 0})
-            total_matches = stats["wins"] + stats["losses"]
-            win_rate = f"{(stats['wins']/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
+            stats = self.manager.character_stats.get(char, {})
+            
+            # Handle both dict and list formats
+            if isinstance(stats, dict):
+                wins = stats.get("wins", 0)
+                losses = stats.get("losses", 0)
+            elif isinstance(stats, list) and len(stats) >= 2:
+                wins = stats[0]
+                losses = stats[1]
+            else:
+                wins = 0
+                losses = 0
+            
+            total_matches = wins + losses
+            win_rate = f"{(wins/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
             tier = self.manager.get_character_tier(char)
             
             # TODO: Implement most defeated/lost to tracking
@@ -2979,8 +3008,8 @@ and Chickenbone's modifications.
             
             self.stats_tree.insert("", "end", values=(
                 char,
-                stats["wins"],
-                stats["losses"],
+                wins,
+                losses,
                 win_rate,
                 tier,
                 most_defeated,
@@ -2994,13 +3023,10 @@ and Chickenbone's modifications.
         # Update stage statistics
         for item in self.stage_tree.get_children():
             stage = self.stage_tree.item(item)["values"][0]
-            stats = self.manager.stage_stats.get(stage, {
-                "times_used": 0,
-                "last_used": "Never"
-            })
+            stats = self.manager.stage_stats.get(stage, {})
             
-            self.stage_tree.set(item, "Times Used", stats["times_used"])
-            self.stage_tree.set(item, "Last Used", stats["last_used"])
+            self.stage_tree.set(item, "Times Used", stats.get("times_used", 0))
+            self.stage_tree.set(item, "Last Used", stats.get("last_used", "Never"))
 
     def _sort_stats(self, column):
         """Sort statistics by the selected column"""
