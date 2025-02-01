@@ -1312,6 +1312,7 @@ class BattleGUI:
         # Initialize variables after root window is created
         self.mode_var = tk.StringVar(value="single")
         self.rounds_var = tk.StringVar(value="1")
+        self.time_var = tk.StringVar(value="99")  # Add this line
         self.continuous_var = tk.BooleanVar(value=False)
         self.random_color_var = tk.BooleanVar(value=True)
         
@@ -1367,6 +1368,22 @@ class BattleGUI:
         self.root.bind('<F10>', lambda e: self._change_random_stage())  # Random stage
         self.root.bind('<F11>', lambda e: self._start_battle_after_betting())  # Force start
         self.root.bind('<F12>', lambda e: self._toggle_ai_level())      # Toggle AI level
+
+        # Initialize settings
+        self.settings = {
+            "tab_order": [],
+            "autosave": True,
+            # Add other settings as needed
+        }
+        
+        # Initialize drag data
+        self._drag_data = {
+            "item": None,
+            "x": 0,
+            "y": 0,
+            "index": None,
+            "dragging": False
+        }
 
     def _create_placeholder_portrait(self):
         """Create a placeholder portrait image"""
@@ -1494,25 +1511,35 @@ class BattleGUI:
         style.configure("Stats.TLabel", font=("Arial", 12), background="black", foreground="white")
         style.configure("Dark.TFrame", background="black")
 
-        # Create notebook for tabs
+        # Create notebook for tabs with draggable support
         self.notebook = ttk.Notebook(self.main_container)
         self.notebook.pack(expand=True, fill="both")
+        self.notebook.enable_traversal()  # Enable keyboard navigation
 
-        # Create all tabs first
-        self.battle_tab = ttk.Frame(self.notebook)
-        self.characters_tab = ttk.Frame(self.notebook)
-        self.stages_tab = ttk.Frame(self.notebook)
-        self.stats_tab = ttk.Frame(self.notebook)
-        self.settings_tab = ttk.Frame(self.notebook)
-        self.preview_tab = ttk.Frame(self.notebook)
+        # Add tab dragging support
+        self._setup_draggable_tabs()
+
+        # Create and add tabs in order
+        self.tabs = {
+            "Battle": ttk.Frame(self.notebook),
+            "Characters": ttk.Frame(self.notebook),
+            "Stages": ttk.Frame(self.notebook),
+            "Statistics": ttk.Frame(self.notebook),
+            "Settings": ttk.Frame(self.notebook),
+            "Battle Preview": ttk.Frame(self.notebook)
+        }
 
         # Add tabs to notebook
-        self.notebook.add(self.battle_tab, text="Battle")
-        self.notebook.add(self.characters_tab, text="Characters")
-        self.notebook.add(self.stages_tab, text="Stages")
-        self.notebook.add(self.stats_tab, text="Statistics")
-        self.notebook.add(self.settings_tab, text="Settings")
-        self.notebook.add(self.preview_tab, text="Battle Preview")
+        for name, frame in self.tabs.items():
+            self.notebook.add(frame, text=name)
+
+        # Store references to commonly used tabs
+        self.battle_tab = self.tabs["Battle"]
+        self.characters_tab = self.tabs["Characters"]
+        self.stages_tab = self.tabs["Stages"]
+        self.stats_tab = self.tabs["Statistics"]
+        self.settings_tab = self.tabs["Settings"]
+        self.preview_tab = self.tabs["Battle Preview"]
 
         # Setup each tab
         self._setup_battle_tab()
@@ -1521,6 +1548,120 @@ class BattleGUI:
         self._setup_stats_tab()
         self._setup_settings_tab()
         self._setup_preview_tab()
+
+        # Add tournament tab last
+        from tournament_gui import TournamentFrame
+        self.tournament_tab = TournamentFrame(self.notebook, self.manager)
+        self.notebook.add(self.tournament_tab, text="Tournament")
+
+        # Load saved tab order if exists
+        if hasattr(self, 'settings') and 'tab_order' in self.settings:
+            self._load_tab_order()
+
+    def _setup_draggable_tabs(self):
+        """Setup drag and drop functionality for tabs"""
+        self.notebook.bind("<Button-1>", self._start_tab_drag)
+        self.notebook.bind("<B1-Motion>", self._drag_tab)
+        self.notebook.bind("<ButtonRelease-1>", self._release_tab)
+
+    def _start_tab_drag(self, event):
+        """Begin tab drag operation"""
+        try:
+            index = self.notebook.index(f"@{event.x},{event.y}")
+            if index >= 0:  # Valid tab clicked
+                self._drag_data = {
+                    "x": event.x,
+                    "y": event.y,
+                    "index": index,
+                    "dragging": True
+                }
+        except tk.TclError:
+            pass
+
+    def _drag_tab(self, event):
+        """Handle tab dragging motion"""
+        if not self._drag_data.get("dragging"):
+            return
+        
+        try:
+            # Get current position
+            current = self.notebook.index(f"@{event.x},{event.y}")
+            original = self._drag_data["index"]
+            
+            # Only move if we're at a different valid position
+            if (current >= 0 and 
+                current != original and 
+                current < self.notebook.index('end')):
+                
+                # Get the moving tab
+                tab = self.notebook.select()
+                if not tab:
+                    return
+                
+                # Store tab info
+                text = self.notebook.tab(tab, "text")
+                
+                # Move the tab directly
+                self.notebook.insert(current, tab)
+                
+                # Update drag index
+                self._drag_data["index"] = current
+                
+                # Save the new order
+                self._save_tab_order(auto_save=False)
+                
+        except tk.TclError:
+            pass
+
+    def _release_tab(self, event):
+        """End tab drag operation"""
+        self._drag_data["dragging"] = False
+
+    def _save_tab_order(self, auto_save=True):
+        """Save current tab order to settings"""
+        try:
+            if not hasattr(self, 'settings'):
+                self.settings = {}
+                
+            tab_order = []
+            for tab in self.notebook.tabs():
+                try:
+                    tab_text = self.notebook.tab(tab, "text")
+                    if tab_text:  # Only add valid tab texts
+                        tab_order.append(tab_text)
+                except tk.TclError:
+                    continue
+            
+            self.settings["tab_order"] = tab_order
+            
+            # Auto-save if enabled and requested
+            if auto_save and hasattr(self, 'autosave_var') and self.autosave_var.get():
+                self.save_config()
+                
+        except Exception as e:
+            print(f"Error saving tab order: {e}")
+            traceback.print_exc()
+
+    def _load_tab_order(self):
+        """Load and apply saved tab order"""
+        try:
+            if "tab_order" in self.settings:
+                saved_order = self.settings["tab_order"]
+                current_tabs = {}
+                
+                # Create mapping of tab text to index
+                for i in range(self.notebook.index('end')):
+                    text = self.notebook.tab(i, "text")
+                    current_tabs[text] = i
+                
+                # Reorder tabs according to saved order
+                for i, tab_text in enumerate(saved_order):
+                    if tab_text in current_tabs:
+                        current_index = current_tabs[tab_text]
+                        if current_index != i:
+                            self._move_tab(current_index, i)
+        except Exception as e:
+            print(f"Error loading tab order: {e}")
 
     def _setup_preview_tab(self):
         """Setup the battle preview tab"""
@@ -2730,56 +2871,30 @@ class BattleGUI:
             self.manager.mugen_path = Path(path)
 
     def save_config(self):
-        """Save current configuration to file"""
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Save Configuration"
-        )
-        if path:
+        """Save configuration including tab order"""
+        try:
             config = {
-                # Battle settings
-                "battle_settings": {
-                    "rounds": self.rounds_var.get(),
-                    "time": self.time_var.get(),  # Add time setting
-                    "battle_mode": self.mode_var.get(),
-                    "team_size": self.team_size_var.get(),
-                    "continuous_mode": self.continuous_var.get(),
-                    "random_color": self.random_color_var.get(),
-                    "team1_size": self.team1_size_var.get(),
-                    "team2_size": self.team2_size_var.get(),
-                    "random_team_sizes": self.random_team_sizes_var.get()
-                },
-                # Character and stage settings
-                "enabled_characters": list(self.manager.settings["enabled_characters"]),
-                "enabled_stages": list(self.manager.settings["enabled_stages"]),
-                
-                # Display settings
-                "theme": self.current_theme,
-                "font_size": self.font_size.get(),
-                
-                # General settings
-                "autosave": self.autosave_var.get(),
-                "backup_frequency": self.backup_freq.get(),
-                
-                # Twitch settings
-                "twitch": {
-                    "bot_name": self.twitch_botname_var.get(),
-                    "channel": self.twitch_channel_var.get(),
-                    "points_reward": self.points_reward_var.get(),
-                    "betting_duration": self.betting_duration_var.get()
-                },
-                
-                # Paths
-                "mugen_path": str(self.manager.mugen_path)
+                "tab_order": self.settings.get("tab_order", []),
+                "autosave": self.settings.get("autosave", True),
+                "rounds": self.rounds_var.get(),
+                "mode": self.mode_var.get(),
+                "time": getattr(self, 'time_var', tk.StringVar(value="99")).get(),
+                "continuous_mode": self.continuous_var.get(),
+                "random_color": self.random_color_var.get(),
+                "team_size": self.team_size_var.get(),
+                "team1_size": self.team1_size_var.get(),
+                "team2_size": self.team2_size_var.get(),
+                "random_team_sizes": self.random_team_sizes_var.get()
             }
             
-            try:
-                with open(path, 'w') as f:
-                    json.dump(config, f, indent=2)
-                messagebox.showinfo("Success", "Configuration saved successfully!")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save configuration: {str(e)}")
+            # Save to file
+            config_path = Path("mugen_battle_config.json")
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+        except Exception as e:
+            print(f"Error saving config: {e}")
+            traceback.print_exc()
 
     def load_config(self):
         """Load configuration from file"""
@@ -3730,6 +3845,146 @@ and Chickenbone's modifications.
                     
         except Exception as e:
             print(f"Error during force cleanup: {e}")
+            traceback.print_exc()
+
+    def _start_tab_drag(self, event):
+        """Begin tab drag operation"""
+        try:
+            index = self.notebook.index(f"@{event.x},{event.y}")
+            if index >= 0:  # Valid tab clicked
+                self._drag_data = {
+                    "x": event.x,
+                    "y": event.y,
+                    "index": index,
+                    "dragging": True
+                }
+        except tk.TclError:
+            pass
+
+    def _drag_tab(self, event):
+        """Handle tab dragging motion"""
+        if not self._drag_data.get("dragging"):
+            return
+        
+        try:
+            # Get current position
+            current = self.notebook.index(f"@{event.x},{event.y}")
+            original = self._drag_data["index"]
+            
+            # Only move if we're at a different valid position
+            if (current >= 0 and 
+                current != original and 
+                current < self.notebook.index('end')):
+                
+                # Get the moving tab
+                tab = self.notebook.select()
+                if not tab:
+                    return
+                
+                # Store tab info
+                text = self.notebook.tab(tab, "text")
+                
+                # Move the tab directly
+                self.notebook.insert(current, tab)
+                
+                # Update drag index
+                self._drag_data["index"] = current
+                
+                # Save the new order
+                self._save_tab_order(auto_save=False)
+                
+        except tk.TclError:
+            pass
+
+    def _release_tab(self, event):
+        """End tab drag operation"""
+        self._drag_data["dragging"] = False
+
+    def _move_tab(self, from_index: int, to_index: int):
+        """Move a tab from one position to another"""
+        try:
+            # Get all tab information first
+            tab_count = self.notebook.index('end')
+            if not (0 <= from_index < tab_count and 0 <= to_index < tab_count):
+                return
+
+            # Store all tab information with their actual widgets
+            tabs = []
+            tab_widgets = self.notebook.winfo_children()
+            tab_ids = self.notebook.tabs()
+
+            for i in range(tab_count):
+                tab_id = tab_ids[i]
+                widget = tab_widgets[i]  # Get widget directly from winfo_children
+                text = self.notebook.tab(tab_id, "text")
+                tabs.append((widget, text))
+
+            # Remove all tabs (but don't destroy widgets)
+            while self.notebook.index('end') > 0:
+                self.notebook.forget(0)
+
+            # Create new order
+            tabs.insert(to_index, tabs.pop(from_index))
+
+            # Add all tabs back in new order
+            for widget, text in tabs:
+                self.notebook.add(widget, text=text)
+
+            # Select the moved tab
+            self.notebook.select(to_index)
+
+            # Update tab references based on text
+            for i, (widget, text) in enumerate(tabs):
+                if text == "Battle":
+                    self.battle_tab = widget
+                elif text == "Characters":
+                    self.characters_tab = widget
+                elif text == "Stages":
+                    self.stages_tab = widget
+                elif text == "Statistics":
+                    self.stats_tab = widget
+                elif text == "Settings":
+                    self.settings_tab = widget
+                elif text == "Battle Preview":
+                    self.preview_tab = widget
+                elif text == "Tournament":
+                    self.tournament_tab = widget
+
+            # Save the new order
+            self._save_tab_order(auto_save=False)
+
+        except Exception as e:
+            print(f"Error moving tab: {e}")
+            traceback.print_exc()
+            
+            # Recovery: try to restore tabs in original order
+            try:
+                for widget, text in tabs:
+                    self.notebook.add(widget, text=text)
+                # Restore tab references
+                self._update_tab_references()
+            except Exception as restore_error:
+                print(f"Failed to restore tabs: {restore_error}")
+
+    def _update_tab_references(self):
+        """Update references to tab widgets after reordering"""
+        try:
+            for i, name in enumerate(self.tabs.keys()):
+                widget = self.notebook.winfo_children()[i]
+                if name == "Battle":
+                    self.battle_tab = widget
+                elif name == "Characters":
+                    self.characters_tab = widget
+                elif name == "Stages":
+                    self.stages_tab = widget
+                elif name == "Statistics":
+                    self.stats_tab = widget
+                elif name == "Settings":
+                    self.settings_tab = widget
+                elif name == "Battle Preview":
+                    self.preview_tab = widget
+        except Exception as e:
+            print(f"Error updating tab references: {e}")
             traceback.print_exc()
 
 if __name__ == "__main__":

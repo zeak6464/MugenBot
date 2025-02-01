@@ -1,92 +1,110 @@
-MUGEN Random AI Battles
+# MUGEN Random AI Battles
 
-This project is a dynamic AI-driven battle manager for the MUGEN fighting game engine. It includes a GUI application for battle control, Twitch bot integration for live interaction, and robust statistics tracking for both characters and stages.
+A comprehensive battle management system for MUGEN fighting game engine, featuring an advanced GUI, tournament system, and Twitch integration. This project enables automated AI battles with extensive tracking and management capabilities.
 
 ## Features
 
-- **Battle Management**:
-  - Single, team, turns, and simultaneous battle modes.
-  - Randomized character and stage selection with customizable filters.
-  - Real-time battle monitoring and result tracking.
+### Battle Management
+- **Multiple Battle Modes**:
+  - Single battles (1v1)
+  - Simultaneous team battles
+  - Tournament system with bracket management
+  - Customizable AI difficulty levels
 
-- **GUI Application**:
-  - Easy-to-use graphical interface for battle setup and control.
-  - Live preview of battles with character and stage stats.
-  - Customizable themes and user-friendly settings.
+- **Character Management**:
+  - Random or manual character selection
+  - Character tier tracking based on performance
+  - Win/loss statistics tracking
+  - Character filtering and organization
 
-- **Twitch Integration**:
-  - Interactive commands for viewers to place bets on battles.
-  - Automated points system with real-time updates.
-  - Dynamic interaction with live chat.
+- **Stage Management**:
+  - Random or specific stage selection
+  - Stage usage statistics
+  - Customizable stage pools for tournaments
 
-- **Statistics Tracking**:
-  - Character performance stats (wins, losses, win rates).
-  - Stage usage stats (times used, total duration, last used).
-  - Exportable and resettable statistics.
+### Tournament System
+- **Tournament Formats**:
+  - Single Elimination brackets
+  - Automatic bracket generation and management
+  - Real-time tournament progress tracking
+  - Visual bracket display
+  - Configurable tournament sizes (4, 8, 16, 32 players)
+
+### GUI Features
+- **Modern Interface**:
+  - Tabbed interface with draggable tabs
+  - Real-time battle preview
+  - Live statistics updates
+  - Tournament bracket visualization
+
+- **Battle Statistics**:
+  - Detailed character performance tracking
+  - Win rates and matchup statistics
+  - Exportable statistics in CSV format
+  - Visual data representations
+
+### Twitch Integration
+- **Interactive Features**:
+  - Viewer betting system
+  - Real-time point tracking
+  - Interactive chat commands
+  - Battle result announcements
 
 ## Installation
 
 1. **Prerequisites**:
-   - Python 3.8 or newer
-   - The following Python libraries:
-     - `os`
-     - `random`
-     - `subprocess`
-     - `json`
-     - `time`
-     - `tkinter`
-     - `Pillow`
-     - `matplotlib`
-     - `numpy`
-     - `twitchio`
-     - `asyncio`
-
-2. **Clone Repository**:
    ```bash
-   git clone https://github.com/your-username/random-ai-battles.git
-   cd random-ai-battles
+   python -m pip install -r requirements.txt
    ```
 
-3. **Install Dependencies**:
-   Install the required libraries manually or via pip:
-   ```bash
-   pip install pillow matplotlib numpy twitchio
-   ```
+2. **Required Python Libraries**:
+   - tkinter (GUI)
+   - Pillow (Image handling)
+   - matplotlib (Statistics visualization)
+   - numpy (Data processing)
+   - twitchio (Twitch integration)
+   - asyncio (Async operations)
 
-4. **Run Application**:
+3. **Setup**:
    ```bash
+   git clone https://github.com/yourusername/mugen-random-battles.git
+   cd mugen-random-battles
    python random_ai_battles.py
    ```
 
 ## Usage
 
-1. Launch the application.
-2. Use the GUI to configure battles:
-   - Select modes, characters, and stages.
-   - Customize settings for rounds, AI levels, and more.
-3. Integrate Twitch for live interactions:
-   - Set up your bot name and Twitch channel.
-   - Enable betting for your audience.
-4. Monitor and review battle results in real-time.
+### Basic Battle Mode
+1. Launch the application
+2. Select the "Battle" tab
+3. Choose battle mode (single/simul)
+4. Configure AI settings
+5. Start battle
 
-## Twitch Commands
+### Tournament Mode
+1. Select the "Tournament" tab
+2. Choose tournament size
+3. Select participating characters
+4. Choose stage pool
+5. Start tournament
+6. Monitor progress in bracket display
 
-- `!bet [team] [amount]`: Place a bet on Team 1 or Team 2.
-- `!points`: Check your current points.
-- `!help`: Display the list of available commands.
-- `!stats`: Show the stats for the current battle.
+### Twitch Integration
+Available commands:
+- `!bet [team] [amount]` - Place bet on current match
+- `!points` - Check points balance
+- `!stats` - View current battle/tournament statistics
+- `!help` - Display available commands
 
 ## Contributing
 
-Contributions are welcome! Please follow these steps:
-
-1. Fork this repository.
-2. Create a branch (`git checkout -b feature/new-feature`).
-3. Commit your changes (`git commit -am 'Add new feature'`).
-4. Push to the branch (`git push origin feature/new-feature`).
-5. Open a Pull Request.
+1. Fork the repository
+2. Create feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit changes (`git commit -m 'Add AmazingFeature'`)
+4. Push to branch (`git push origin feature/AmazingFeature`)
+5. Open Pull Request
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
