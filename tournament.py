@@ -9,96 +9,83 @@ class TournamentFormat(Enum):
     SINGLE_ELIMINATION = "Single Elimination"
 
 class MugenTournament:
-    def __init__(self, battle_manager, players: List[str], stage_pool: Optional[List[str]] = None):
-        """
-        Initialize tournament with battle manager and players
-        
-        Args:
-            battle_manager: MugenBattleManager instance to handle matches
-            players: List of character names to participate
-            stage_pool: Optional list of stages to use (uses all enabled stages if None)
-        """
+    def __init__(self, battle_manager, players: List[str]):
+        """Initialize tournament with battle manager and players"""
         self.manager = battle_manager
         self.players = players
-        self.stage_pool = stage_pool or list(self.manager.settings["enabled_stages"])
-        self.current_battle = None
         self.format = TournamentFormat.SINGLE_ELIMINATION
         
-        # Initialize brackets list
-        self.brackets = []
+        # Tournament state
         self.current_round = 0
-        self.current_match_index = 0
+        self.current_match = 0
+        self.current_battle = None
+        self.matches = []
+        self.results = {}
         
-        # Set up the tournament
-        self._setup_single_elimination()
-
-    def _setup_single_elimination(self):
-        """Setup a single elimination bracket"""
-        # Calculate number of byes needed
-        bracket_size = 2 ** math.ceil(math.log2(len(self.players)))
-        num_byes = bracket_size - len(self.players)
+        # Set up the tournament bracket
+        self._setup_bracket()
+    
+    def _setup_bracket(self):
+        """Setup the tournament bracket structure"""
+        num_players = len(self.players)
+        num_rounds = math.ceil(math.log2(num_players))
+        total_slots = 2 ** num_rounds
         
-        # Create first round matches with byes
-        first_round = self.players + ['BYE'] * num_byes
-        random.shuffle(first_round)
+        # Initialize matches list
+        self.matches = []
         
-        first_round_matches = []
-        for i in range(0, len(first_round), 2):
-            match = {
-                'player1': first_round[i],
-                'player2': first_round[i + 1],
+        # First round setup
+        first_round = []
+        byes = total_slots - num_players
+        
+        # Shuffle players
+        random.shuffle(self.players)
+        
+        # Create first round matches
+        for i in range(0, num_players, 2):
+            if i + 1 < num_players:
+                # Regular match
+                first_round.append({
+                    'p1': self.players[i],
+                    'p2': self.players[i + 1],
+                    'winner': None,
+                    'round': 0
+                })
+            else:
+                # Bye match
+                first_round.append({
+                    'p1': self.players[i],
+                    'p2': None,
+                    'winner': self.players[i],  # Automatic win
+                    'round': 0
+                })
+        
+        # Add remaining byes
+        while len(first_round) < total_slots // 2:
+            first_round.append({
+                'p1': None,
+                'p2': None,
                 'winner': None,
-                'loser': None,
-                'stage': random.choice(self.stage_pool),
-                'completed': False,
                 'round': 0
-            }
-            # Auto-advance matches with BYE
-            if match['player2'] == 'BYE':
-                match['winner'] = match['player1']
-                match['completed'] = True
-            elif match['player1'] == 'BYE':
-                match['winner'] = match['player2']
-                match['completed'] = True
-            
-            first_round_matches.append(match)
+            })
         
-        self.brackets = [first_round_matches]
-
-    def advance_round(self):
-        """Set up next round matches"""
-        if not self.brackets or self.current_round >= len(self.brackets):
-            return
-            
-        current_round = self.brackets[self.current_round]
-        winners = []
+        self.matches.append(first_round)
         
-        # Get winners from current round
-        for match in current_round:
-            if match['completed'] and match['winner']:
-                winners.append(match['winner'])
-        
-        # Create next round matches
-        if len(winners) >= 2:
-            next_round = []
-            for i in range(0, len(winners), 2):
-                if i + 1 < len(winners):
-                    match = {
-                        'player1': winners[i],
-                        'player2': winners[i + 1],
-                        'winner': None,
-                        'loser': None,
-                        'stage': random.choice(self.stage_pool),
-                        'completed': False,
-                        'round': self.current_round + 1
-                    }
-                    next_round.append(match)
+        # Setup subsequent rounds
+        for r in range(1, num_rounds):
+            round_matches = []
+            prev_round = self.matches[r - 1]
             
-            if next_round:
-                self.brackets.append(next_round)
-                self.current_round += 1
-                self.current_match_index = 0
-
+            for i in range(0, len(prev_round), 2):
+                round_matches.append({
+                    'p1': None,  # Will be filled by winners
+                    'p2': None,
+                    'winner': None,
+                    'round': r
+                })
+            
+            self.matches.append(round_matches)
+    
     def get_bracket_display(self) -> str:
         """Get a text representation of the tournament bracket"""
         display = []
@@ -107,117 +94,133 @@ class MugenTournament:
         display.append(f"Tournament Type: {self.format.value}")
         display.append("-" * 40)
         
-        # Show rounds and matches
-        for round_num, round_matches in enumerate(self.brackets):
+        # Show each round
+        for round_num, round_matches in enumerate(self.matches):
             display.append(f"\nRound {round_num + 1}:")
+            display.append("-" * 20)
+            
             for match_num, match in enumerate(round_matches, 1):
-                p1 = match['player1']
-                p2 = match['player2']
-                if match['completed']:
-                    winner = match['winner']
-                    display.append(f"Match {match_num}: {p1} vs {p2} -> {winner}")
-                else:
-                    display.append(f"Match {match_num}: {p1} vs {p2}")
+                p1 = match['p1'] or "BYE"
+                p2 = match['p2'] or "BYE"
+                winner = match['winner'] or "?"
+                
+                display.append(f"Match {match_num}: {p1} vs {p2}")
+                if winner != "?":
+                    display.append(f"Winner: {winner}")
+                display.append("")
         
         return "\n".join(display)
-
+    
     def is_complete(self) -> bool:
         """Check if tournament is complete"""
-        if not self.brackets:
+        if not self.matches:
             return False
-        return len(self.brackets[-1]) == 1 and self.brackets[-1][0]['completed']
-
+        final_match = self.matches[-1][0]
+        return final_match['winner'] is not None
+    
     def get_winner(self) -> Optional[str]:
         """Get the tournament winner if tournament is complete"""
         if self.is_complete():
-            return self.brackets[-1][0]['winner']
+            return self.matches[-1][0]['winner']
         return None
-
+    
     def start_next_match(self) -> Optional[Dict]:
         """Start the next match in the tournament"""
-        try:
-            if not self.brackets or self.current_round >= len(self.brackets):
-                return None
+        if self.is_complete():
+            return None
             
-            current_round = self.brackets[self.current_round]
-            
-            # Find next unplayed match
-            while self.current_match_index < len(current_round):
-                match = current_round[self.current_match_index]
-                if not match['completed']:
-                    # Prepare battle info
+        # Find next unplayed match
+        for round_num, round_matches in enumerate(self.matches):
+            for match_num, match in enumerate(round_matches):
+                if match['winner'] is None and match['p1'] is not None and match['p2'] is not None:
+                    # Found next match to play
+                    
+                    # Select random stage from enabled stages
+                    enabled_stages = list(self.manager.settings.get("enabled_stages", []))
+                    if not enabled_stages:
+                        raise ValueError("No stages are enabled for tournament play!")
+                    selected_stage = random.choice(enabled_stages)
+                    
+                    # Clean up character paths - remove any 'chars/' prefix if present
+                    p1_char = match['p1'].replace('chars/', '') if match['p1'].startswith('chars/') else match['p1']
+                    p2_char = match['p2'].replace('chars/', '') if match['p2'].startswith('chars/') else match['p2']
+                    
+                    # Verify character paths exist
+                    p1_path = Path(f"chars/{p1_char}/{p1_char}.def")
+                    p2_path = Path(f"chars/{p2_char}/{p2_char}.def")
+                    
+                    if not p1_path.exists():
+                        raise ValueError(f"Character not found: {p1_char}")
+                    if not p2_path.exists():
+                        raise ValueError(f"Character not found: {p2_char}")
+                    
                     battle_info = {
-                        'mode': 'single',
-                        'p1': match['player1'],
-                        'p2': match['player2'],
-                        'stage': match['stage'],
+                        'mode': "single",
+                        'p1': p1_char,
+                        'p2': p2_char,
+                        'stage': selected_stage,
                         'tournament_match': True,
-                        'match_index': self.current_match_index,
-                        'round': self.current_round
+                        'round': round_num,
+                        'match': match_num
                     }
                     
-                    self.current_battle = battle_info
-                    self.manager.start_battle(battle_info)
+                    # Start the battle
+                    self.current_battle = self.manager.start_battle(battle_info)
                     return battle_info
                     
-                self.current_match_index += 1
-                
-            # If we get here, current round is complete
-            self.advance_round()
-            self.current_match_index = 0
-            return self.start_next_match() if not self.is_complete() else None
-            
-        except Exception as e:
-            print(f"Error starting next match: {e}")
-            return None
-
+        return None
+    
     def check_match_result(self) -> Optional[Dict]:
-        """Check current match result"""
+        """Check the result of the current match"""
         if not self.current_battle:
             return None
-        
+            
         result = self.manager.check_battle_result()
-        if result:
-            # Process match result
-            match_index = self.current_battle['match_index']
-            current_round = self.brackets[self.current_round]
-            match = current_round[match_index]
+        if not result:
+            return None
             
-            match['winner'] = result['winner']
-            match['loser'] = result['loser']
-            match['completed'] = True
-            
-            # Clear current battle
-            self.current_battle = None
-            
-            # Check if round is complete
-            if all(m['completed'] for m in current_round):
-                self.advance_round()
-                self.current_match_index = 0
-            else:
-                self.current_match_index += 1
-            
-            return result
+        # Process match result
+        winner = result['winner']
+        current_round = self.matches[self.current_battle['round']]
+        current_match = current_round[self.current_battle['match']]
         
-        return None
+        # Update match result
+        current_match['winner'] = winner
+        
+        # Update next round if necessary
+        if self.current_battle['round'] < len(self.matches) - 1:
+            next_round = self.matches[self.current_battle['round'] + 1]
+            next_match_index = self.current_battle['match'] // 2
+            next_match = next_round[next_match_index]
+            
+            # Determine which slot to fill (p1 or p2)
+            if self.current_battle['match'] % 2 == 0:
+                next_match['p1'] = winner
+            else:
+                next_match['p2'] = winner
+        
+        # Clear current battle
+        self.current_battle = None
+        
+        return result
 
 def create_tournament(battle_manager, num_players: int = 8) -> MugenTournament:
     """Create a new tournament with random selection of enabled characters"""
-    enabled_chars = list(battle_manager.settings["enabled_characters"])
+    enabled_chars = list(battle_manager.settings.get("enabled_characters", []))
+    
     if len(enabled_chars) < num_players:
         raise ValueError(f"Not enough enabled characters for {num_players}-player tournament")
-        
-    # Randomly select players
+    
+    # Select random characters
     players = random.sample(enabled_chars, num_players)
     
     # Create tournament
     return MugenTournament(battle_manager, players)
 
-# Example usage with MugenBattleManager
 if __name__ == "__main__":
+    # Test tournament creation and display
     from random_ai_battles import MugenBattleManager
     
-    # Initialize battle manager
     manager = MugenBattleManager()
     
     # Create tournament with 8 random characters
@@ -232,17 +235,14 @@ if __name__ == "__main__":
         match_info = tournament.start_next_match()
         if match_info:
             print(f"\nStarting match: {match_info['p1']} vs {match_info['p2']}")
-            
-            # Wait for match to complete
-            while True:
-                result = tournament.check_match_result()
-                if result:
-                    print(f"Winner: {result['winner']}")
-                    break
-                time.sleep(1)
+        
+        # Wait for result
+        while True:
+            result = tournament.check_match_result()
+            if result:
+                break
     
-    # Print final results
     print("\nTournament Complete!")
     print(f"Winner: {tournament.get_winner()}")
-    print("\nFinal Bracket:")
+    
     print(tournament.get_bracket_display()) 
