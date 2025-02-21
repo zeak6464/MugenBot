@@ -23,6 +23,7 @@ import traceback
 import msvcrt  # For Windows file locking
 import psutil
 import shutil
+import sys
 
 class MugenBattleManager:
     def __init__(self):
@@ -216,17 +217,88 @@ class MugenBattleManager:
                 print(f"Error restoring backup: {be}")
 
     def update_stats(self, winner: str, loser: str):
-        """Update win/loss statistics"""
+        """Update win/loss statistics and matchup tracking"""
         # Update character stats
         for char in [winner, loser]:
             if char not in self.character_stats:
-                self.character_stats[char] = {"wins": 0, "losses": 0}
+                self.character_stats[char] = {
+                    "wins": 0,
+                    "losses": 0,
+                    "matchups": {},  # Store matchup data
+                    "most_defeated": {},  # Track wins against specific characters
+                    "most_lost_to": {}    # Track losses against specific characters
+                }
         
+        # Update overall wins/losses
         self.character_stats[winner]["wins"] += 1
         self.character_stats[loser]["losses"] += 1
+        
+        # Update matchup data for winner
+        if loser not in self.character_stats[winner]["matchups"]:
+            self.character_stats[winner]["matchups"][loser] = {"wins": 0, "losses": 0}
+        self.character_stats[winner]["matchups"][loser]["wins"] += 1
+        
+        # Update most_defeated counter for winner
+        if loser not in self.character_stats[winner]["most_defeated"]:
+            self.character_stats[winner]["most_defeated"][loser] = 0
+        self.character_stats[winner]["most_defeated"][loser] += 1
+        
+        # Update matchup data for loser
+        if winner not in self.character_stats[loser]["matchups"]:
+            self.character_stats[loser]["matchups"][winner] = {"wins": 0, "losses": 0}
+        self.character_stats[loser]["matchups"][winner]["losses"] += 1
+        
+        # Update most_lost_to counter for loser
+        if winner not in self.character_stats[loser]["most_lost_to"]:
+            self.character_stats[loser]["most_lost_to"][winner] = 0
+        self.character_stats[loser]["most_lost_to"][winner] += 1
 
         # Save immediately after update
         self.save_stats()
+
+    def get_character_matchups(self, char_name: str) -> Dict:
+        """Get detailed matchup statistics for a character"""
+        if char_name not in self.character_stats:
+            return {}
+            
+        stats = self.character_stats[char_name]
+        matchups = stats.get("matchups", {})
+        
+        # Calculate win rates for each matchup
+        detailed_matchups = {}
+        for opponent, data in matchups.items():
+            total_matches = data["wins"] + data["losses"]
+            win_rate = (data["wins"] / total_matches * 100) if total_matches > 0 else 0
+            detailed_matchups[opponent] = {
+                "wins": data["wins"],
+                "losses": data["losses"],
+                "total_matches": total_matches,
+                "win_rate": f"{win_rate:.1f}%"
+            }
+            
+        return detailed_matchups
+
+    def get_most_defeated_opponent(self, char_name: str) -> str:
+        """Get the opponent that this character has defeated the most"""
+        if char_name not in self.character_stats:
+            return "N/A"
+            
+        most_defeated = self.character_stats[char_name].get("most_defeated", {})
+        if not most_defeated:
+            return "N/A"
+            
+        return max(most_defeated.items(), key=lambda x: x[1])[0]
+
+    def get_most_lost_to_opponent(self, char_name: str) -> str:
+        """Get the opponent that this character has lost to the most"""
+        if char_name not in self.character_stats:
+            return "N/A"
+            
+        most_lost_to = self.character_stats[char_name].get("most_lost_to", {})
+        if not most_lost_to:
+            return "N/A"
+            
+        return max(most_lost_to.items(), key=lambda x: x[1])[0]
 
     def update_stage_stats(self, stage: str):
         """Update stage usage statistics"""
@@ -390,25 +462,37 @@ class MugenBattleManager:
         print("Running command:", cmd_str)
 
         try:
-            # Start MUGEN process with timeout handling
+            # Start MUGEN process
             process = subprocess.Popen(cmd_str, shell=True, cwd=str(self.mugen_path.parent))
             
-            # Wait up to 5 seconds for process to start
-            for _ in range(50):
+            # Give more time for the process to start and be detected
+            start_time = time.time()
+            max_wait = 10  # Wait up to 10 seconds
+            
+            while time.time() - start_time < max_wait:
                 if self._check_mugen_running():
-                    break
-                time.sleep(0.1)
+                    # Process found, record battle start time and info
+                    self.battle_start_time = time.time()
+                    self.current_battle = battle_info
+                    return battle_info
+                time.sleep(0.2)  # Longer sleep between checks
             
-            if not self._check_mugen_running():
+            # If we get here, check one last time before giving up
+            if self._check_mugen_running():
+                self.battle_start_time = time.time()
+                self.current_battle = battle_info
+                return battle_info
+                
+            # Only raise error if process really isn't running
+            if process.poll() is not None:  # Process has terminated
                 raise RuntimeError("MUGEN process failed to start")
-            
-            # Record battle start time
-            self.battle_start_time = time.time()
-            
-            # Store current battle info
-            self.current_battle = battle_info
-            
-            return battle_info
+            else:
+                # Process is running but not detected, proceed anyway
+                print("Warning: MUGEN process not detected but seems to be running")
+                self.battle_start_time = time.time()
+                self.current_battle = battle_info
+                return battle_info
+                
         except Exception as e:
             print(f"Error starting battle: {e}")
             traceback.print_exc()
@@ -424,7 +508,7 @@ class MugenBattleManager:
         """Check if any MUGEN process is running"""
         try:
             # Check for all possible MUGEN executables
-            mugen_exes = ['mugen.exe', '3v3.exe', '4v4.exe']
+            mugen_exes = ['mugen.exe', 'Mugen.exe', '3v3.exe', '4v4.exe']  # Added Mugen.exe variant
             for exe in mugen_exes:
                 result = subprocess.run(
                     f'tasklist /FI "IMAGENAME eq {exe}" /NH', 
@@ -432,7 +516,7 @@ class MugenBattleManager:
                     capture_output=True, 
                     text=True
                 )
-                if exe in result.stdout:
+                if exe.lower() in result.stdout.lower():  # Case-insensitive check
                     return True
             return False
         except Exception as e:
@@ -472,8 +556,15 @@ class MugenBattleManager:
 
     def _process_battle_result(self, result) -> Dict:
         """Process the battle result and update statistics"""
+        # If there's no current battle or the result was already processed, skip
+        if not self.current_battle or getattr(self, '_battle_processed', False):
+            return None
+            
         p1_score, p2_score = result
         print(f"Processing battle result: P1={p1_score}, P2={p2_score}")  # Debug print
+        
+        # Set processed flag
+        self._battle_processed = True
         
         if self.current_battle["mode"] == "single":
             if p1_score > p2_score:
@@ -499,13 +590,7 @@ class MugenBattleManager:
             self.record_battle(battle_result)
             
             # Clean up
-            if self.watcher_log.exists():
-                try:
-                    self.watcher_log.unlink()
-                except PermissionError:
-                    print("Warning: Could not delete watcher log")
-            
-            self.current_battle = None
+            self._cleanup_battle()
             
             print(f"Processed battle result: {battle_result}")  # Debug print
             return battle_result
@@ -537,15 +622,26 @@ class MugenBattleManager:
 
             # Record and clean up
             self.record_battle(battle_result)
-            if self.watcher_log.exists():
-                try:
-                    self.watcher_log.unlink()
-                except PermissionError:
-                    print("Warning: Could not delete watcher log")
-            self.current_battle = None
+            self._cleanup_battle()
             
             print(f"Processed team battle result: {battle_result}")  # Debug print
             return battle_result
+
+    def _cleanup_battle(self):
+        """Clean up after a battle is complete"""
+        if self.watcher_log.exists():
+            try:
+                self.watcher_log.unlink()
+            except PermissionError:
+                print("Warning: Could not delete watcher log")
+                time.sleep(0.5)  # Wait briefly and try again
+                try:
+                    self.watcher_log.unlink()
+                except:
+                    pass
+        
+        self.current_battle = None
+        self._battle_processed = False  # Reset processed flag for next battle
 
     def _start_single_battle(self, enabled_chars, stage):
         """Start a single 1v1 battle"""
@@ -1301,8 +1397,21 @@ class BattleGUI:
         
         # Create root window first
         self.root = tk.Tk()
-        self.root.title("MUGEN Random AI Battles")
+        self.root.title("MUGEN Battle Manager")
         self.root.geometry("1024x768")
+        
+        # Initialize battle tracking
+        self.current_battle = None
+        self.battle_monitor = None
+        
+        # Initialize settings dictionary
+        self.settings = {
+            "tab_order": ["Preview", "Battle", "Characters", "Stages", "Stats", "Tournament", "Settings"],
+            "autosave": True,
+            "theme": "light",
+            "font_size": 10,
+            "backup_frequency": "Weekly"
+        }
         
         # Set window icon if available
         icon_path = Path("icon.ico")
@@ -1312,7 +1421,7 @@ class BattleGUI:
         # Initialize variables after root window is created
         self.mode_var = tk.StringVar(value="single")
         self.rounds_var = tk.StringVar(value="1")
-        self.time_var = tk.StringVar(value="99")  # Add this line
+        self.time_var = tk.StringVar(value="99")
         self.continuous_var = tk.BooleanVar(value=False)
         self.random_color_var = tk.BooleanVar(value=True)
         
@@ -1332,21 +1441,23 @@ class BattleGUI:
         self.betting_duration_var = tk.IntVar(value=20)
         self.points_reward_var = tk.IntVar(value=100)
         
-        # Add placeholder image paths
-        self.placeholder_portrait = self._create_placeholder_portrait()
-        self.placeholder_stage = self._create_placeholder_stage()
+        # Initialize theme and style
+        self.current_theme = "light"
+        self.load_theme()
+        
+        # Create placeholder images
+        self._create_placeholder_images()
         
         # Initialize battle log and status label
         self.battle_log = None
         self.twitch_status_label = None
         
-        # Setup GUI components
-        self.load_theme()
+        # Create menu
         self.create_menu()
+        
+        # Setup main GUI
         self.setup_gui()
         
-        self.battle_monitor = None
-        self.current_theme = "light"
         self.executor = ThreadPoolExecutor(max_workers=1)
         
         # Load default config if it exists
@@ -1360,644 +1471,888 @@ class BattleGUI:
                 print(f"Failed to load default config: {e}")
 
         # Bind keyboard shortcuts
-        self.root.bind('<F5>', lambda e: self._start_battle())          # Start battle
-        self.root.bind('<F6>', lambda e: self.stop_battle())           # Stop battle
-        self.root.bind('<F7>', lambda e: self._quick_rematch())         # Quick rematch
-        self.root.bind('<F8>', lambda e: self._force_next_round())      # Force next round
-        self.root.bind('<F9>', lambda e: self._reset_battle_scores())   # Reset scores
-        self.root.bind('<F10>', lambda e: self._change_random_stage())  # Random stage
-        self.root.bind('<F11>', lambda e: self._start_battle_after_betting())  # Force start
-        self.root.bind('<F12>', lambda e: self._toggle_ai_level())      # Toggle AI level
+        self.root.bind('<F5>', lambda e: self._start_battle())
+        self.root.bind('<F6>', lambda e: self.stop_battle())
+        self.root.bind('<F7>', lambda e: self._quick_rematch())
+        self.root.bind('<F8>', lambda e: self._force_next_round())
+        self.root.bind('<F9>', lambda e: self._reset_battle_scores())
+        self.root.bind('<F10>', lambda e: self._change_random_stage())
 
-        # Initialize settings
-        self.settings = {
-            "tab_order": [],
-            "autosave": True,
-            # Add other settings as needed
-        }
+    def _create_placeholder_images(self):
+        """Create placeholder images for portraits and stages"""
+        # Create portrait placeholder
+        portrait_size = (200, 200)
+        portrait = Image.new('RGB', portrait_size, 'gray')
+        draw = ImageDraw.Draw(portrait)
+        draw.text((100, 100), "No\nPortrait", fill='white', anchor='mm', align='center')
+        self.placeholder_portrait = ImageTk.PhotoImage(portrait)
         
-        # Initialize drag data
-        self._drag_data = {
-            "item": None,
-            "x": 0,
-            "y": 0,
-            "index": None,
-            "dragging": False
-        }
-
-    def _create_placeholder_portrait(self):
-        """Create a placeholder portrait image"""
-        size = (200, 200)
-        img = Image.new('RGB', size, '#2D2D2D')
-        draw = ImageDraw.Draw(img)
-        
-        # Draw a character silhouette
-        draw.rectangle([40, 40, 160, 160], fill='#3D3D3D')
-        draw.ellipse([70, 20, 130, 80], fill='#3D3D3D')  # head
-        
-        # Add text
-        try:
-            font = ImageFont.truetype("segoe ui", 14)
-        except:
-            font = ImageFont.load_default()
-        
-        draw.text((100, 170), "No Portrait", font=font, fill='#CCCCCC', anchor='ms')
-        
-        return ImageTk.PhotoImage(img)
-
-    def _create_placeholder_stage(self):
-        """Create a placeholder stage preview image"""
-        size = (480, 270)  # 16:9 aspect ratio
-        img = Image.new('RGB', size, '#2D2D2D')
-        draw = ImageDraw.Draw(img)
-        
-        # Draw a simple stage representation
-        draw.rectangle([40, 180, 440, 220], fill='#3D3D3D')  # platform
-        draw.rectangle([0, 220, 480, 270], fill='#3D3D3D')   # ground
-        
-        # Add decorative elements
-        draw.rectangle([60, 140, 100, 180], fill='#3D3D3D')  # background element
-        draw.rectangle([380, 120, 420, 180], fill='#3D3D3D') # background element
-        
-        # Add text
-        try:
-            font = ImageFont.truetype("segoe ui", 20)
-        except:
-            font = ImageFont.load_default()
-        
-        draw.text((240, 135), "Stage Preview Not Available", font=font, fill='#CCCCCC', anchor='ms')
-        
-        return ImageTk.PhotoImage(img)
-
-    def load_theme(self):
-        """Load custom theme colors"""
-        self.theme = {
-            "light": {
-                "bg": "#ffffff",
-                "fg": "#000000",
-                "select_bg": "#0078d7",
-                "select_fg": "#ffffff",
-                "button_bg": "#e1e1e1",
-                "accent": "#0078d7"
-            },
-            "dark": {
-                "bg": "#1e1e1e",
-                "fg": "#ffffff",
-                "select_bg": "#0078d7",
-                "select_fg": "#ffffff",
-                "button_bg": "#333333",
-                "accent": "#0078d7"
-            }
-        }
-        self.apply_theme("light")  # Default theme
-
-    def apply_theme(self, theme_name):
-        """Apply the selected theme"""
-        theme = self.theme[theme_name]
-        self.root.configure(bg=theme["bg"])
-        style = ttk.Style()
-        
-        # Configure ttk styles
-        style.configure(".", 
-                       background=theme["bg"],
-                       foreground=theme["fg"],
-                       fieldbackground=theme["bg"])
-        
-        style.configure("Accent.TButton",
-                       background=theme["accent"],
-                       foreground=theme["fg"])
-        
-        self.current_theme = theme_name
-
-    def create_menu(self):
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-
-        # File Menu
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Save Configuration", command=self.save_config)
-        file_menu.add_command(label="Load Configuration", command=self.load_config)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
-
-        # View Menu
-        view_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Light Theme", command=lambda: self.apply_theme("light"))
-        view_menu.add_command(label="Dark Theme", command=lambda: self.apply_theme("dark"))
-
-        # Tools Menu
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Export Statistics", command=self.export_stats)
-        tools_menu.add_command(label="Reset Statistics", command=self.reset_stats)
-
-        # Help Menu
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="Documentation", command=self.show_documentation)
-        help_menu.add_command(label="About", command=self.show_about)
+        # Create stage placeholder
+        stage_size = (400, 200)
+        stage = Image.new('RGB', stage_size, 'darkgray')
+        draw = ImageDraw.Draw(stage)
+        draw.text((200, 100), "No Stage Preview", fill='white', anchor='mm')
+        self.placeholder_stage = ImageTk.PhotoImage(stage)
 
     def setup_gui(self):
-        # Create main container
-        self.main_container = ttk.Frame(self.root)
-        self.main_container.pack(expand=True, fill="both", padx=10, pady=10)
-
+        """Setup the main GUI components"""
         # Configure styles for preview tab
         style = ttk.Style()
         style.configure("Preview.TFrame", background="black")
         style.configure("Name.TLabel", font=("Arial Black", 16, "bold"), background="black", foreground="white")
         style.configure("Stats.TLabel", font=("Arial", 12), background="black", foreground="white")
         style.configure("Dark.TFrame", background="black")
-
-        # Create notebook for tabs with draggable support
-        self.notebook = ttk.Notebook(self.main_container)
-        self.notebook.pack(expand=True, fill="both")
-        self.notebook.enable_traversal()  # Enable keyboard navigation
-
-        # Add tab dragging support
-        self._setup_draggable_tabs()
-
-        # Create and add tabs in order
-        self.tabs = {
-            "Battle": ttk.Frame(self.notebook),
-            "Characters": ttk.Frame(self.notebook),
-            "Stages": ttk.Frame(self.notebook),
-            "Statistics": ttk.Frame(self.notebook),
-            "Settings": ttk.Frame(self.notebook),
-            "Battle Preview": ttk.Frame(self.notebook)
-        }
-
-        # Add tabs to notebook
-        for name, frame in self.tabs.items():
-            self.notebook.add(frame, text=name)
-
-        # Store references to commonly used tabs
-        self.battle_tab = self.tabs["Battle"]
-        self.characters_tab = self.tabs["Characters"]
-        self.stages_tab = self.tabs["Stages"]
-        self.stats_tab = self.tabs["Statistics"]
-        self.settings_tab = self.tabs["Settings"]
-        self.preview_tab = self.tabs["Battle Preview"]
-
-        # Setup each tab
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize tabs dictionary
+        self.tabs = {}
+        
+        # Create all main tabs
+        tab_names = ["Preview", "Battle", "Characters", "Stages", "Stats", "Tournament", "Settings"]
+        for tab_name in tab_names:
+            self.tabs[tab_name] = ttk.Frame(self.notebook)
+            self.notebook.add(self.tabs[tab_name], text=tab_name)
+        
+        # Setup individual tabs
+        self._setup_preview_tab()
         self._setup_battle_tab()
         self._setup_characters_tab()
         self._setup_stages_tab()
         self._setup_stats_tab()
+        self._setup_tournament_tab()
         self._setup_settings_tab()
-        self._setup_preview_tab()
-
-        # Add tournament tab last
-        from tournament_gui import TournamentFrame
-        self.tournament_tab = TournamentFrame(self.notebook, self.manager)
-        self.notebook.add(self.tournament_tab, text="Tournament")
-
-        # Load saved tab order if exists
-        if hasattr(self, 'settings') and 'tab_order' in self.settings:
-            self._load_tab_order()
-
-    def _setup_draggable_tabs(self):
-        """Setup drag and drop functionality for tabs"""
-        self.notebook.bind("<Button-1>", self._start_tab_drag)
-        self.notebook.bind("<B1-Motion>", self._drag_tab)
-        self.notebook.bind("<ButtonRelease-1>", self._release_tab)
-
-    def _start_tab_drag(self, event):
-        """Begin tab drag operation"""
-        try:
-            index = self.notebook.index(f"@{event.x},{event.y}")
-            if index >= 0:  # Valid tab clicked
-                self._drag_data = {
-                    "x": event.x,
-                    "y": event.y,
-                    "index": index,
-                    "dragging": True
-                }
-        except tk.TclError:
-            pass
-
-    def _drag_tab(self, event):
-        """Handle tab dragging motion"""
-        if not self._drag_data.get("dragging"):
-            return
         
-        try:
-            # Get current position
-            current = self.notebook.index(f"@{event.x},{event.y}")
-            original = self._drag_data["index"]
-            
-            # Only move if we're at a different valid position
-            if (current >= 0 and 
-                current != original and 
-                current < self.notebook.index('end')):
-                
-                # Get the moving tab
-                tab = self.notebook.select()
-                if not tab:
-                    return
-                
-                # Store tab info
-                text = self.notebook.tab(tab, "text")
-                
-                # Move the tab directly
-                self.notebook.insert(current, tab)
-                
-                # Update drag index
-                self._drag_data["index"] = current
-                
-                # Save the new order
-                self._save_tab_order(auto_save=False)
-                
-        except tk.TclError:
-            pass
+        # Setup draggable tabs
+        self._setup_draggable_tabs()
+        
+        # Load saved tab order
+        self._load_tab_order()
+        
+        # Configure auto-save
+        self.auto_save_timer = None
+        self.start_auto_save_timer()
 
-    def _release_tab(self, event):
-        """End tab drag operation"""
-        self._drag_data["dragging"] = False
+    def _setup_tournament_tab(self):
+        """Setup the tournament tab"""
+        tournament_frame = ttk.Frame(self.notebook)
+        self.notebook.add(tournament_frame, text='Tournament')
+        
+        # Create control frame
+        control_frame = ttk.Frame(tournament_frame)
+        control_frame.pack(fill='x', padx=5, pady=5)
+        
+        # Tournament settings
+        settings_frame = ttk.LabelFrame(control_frame, text='Tournament Settings')
+        settings_frame.pack(fill='x', padx=5, pady=5)
+        
+        # Bracket size selection
+        size_frame = ttk.Frame(settings_frame)
+        size_frame.pack(fill='x', padx=5, pady=5)
+        
+        ttk.Label(size_frame, text='Bracket Size:').pack(side='left', padx=5)
+        self.bracket_size_var = tk.IntVar(value=8)  # Default to 8 players
+        sizes = [4, 8, 16, 32, 64]
+        bracket_size_menu = ttk.OptionMenu(size_frame, self.bracket_size_var, 8, *sizes)
+        bracket_size_menu.pack(side='left', padx=5)
+        
+        # Tournament mode selection
+        mode_frame = ttk.Frame(settings_frame)
+        mode_frame.pack(fill='x', padx=5, pady=5)
+        
+        ttk.Label(mode_frame, text='Mode:').pack(side='left', padx=5)
+        self.tournament_mode_var = tk.StringVar(value='single')
+        modes = ['single', 'team', 'turns', 'simul']
+        mode_menu = ttk.OptionMenu(mode_frame, self.tournament_mode_var, 'single', *modes)
+        mode_menu.pack(side='left', padx=5)
+        
+        # Tournament controls
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack(fill='x', padx=5, pady=5)
+        
+        self.create_tournament_btn = ttk.Button(
+            button_frame, 
+            text='Create Tournament',
+            command=self._create_tournament
+        )
+        self.create_tournament_btn.pack(side='left', padx=5)
+        
+        self.start_tournament_btn = ttk.Button(
+            button_frame,
+            text='Start/Continue',
+            command=self._start_tournament,
+            state='disabled'
+        )
+        self.start_tournament_btn.pack(side='left', padx=5)
+        
+        self.reset_tournament_btn = ttk.Button(
+            button_frame,
+            text='Reset Tournament',
+            command=self._reset_tournament,
+            state='disabled'
+        )
+        self.reset_tournament_btn.pack(side='left', padx=5)
+        
+        # Create tournament bracket display
+        bracket_frame = ttk.Frame(tournament_frame)
+        bracket_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Create tournament tree
+        self.tournament_tree = ttk.Treeview(
+            bracket_frame,
+            columns=('Match', 'Player 1', 'Player 2', 'Winner'),
+            show='headings',
+            selectmode='browse'
+        )
+        
+        # Configure columns
+        self.tournament_tree.heading('Match', text='Match')
+        self.tournament_tree.heading('Player 1', text='Player 1')
+        self.tournament_tree.heading('Player 2', text='Player 2')
+        self.tournament_tree.heading('Winner', text='Winner')
+        
+        # Set column widths
+        self.tournament_tree.column('Match', width=150)
+        self.tournament_tree.column('Player 1', width=200)
+        self.tournament_tree.column('Player 2', width=200)
+        self.tournament_tree.column('Winner', width=150)
+        
+        # Add scrollbar
+        tournament_scroll = ttk.Scrollbar(
+            bracket_frame,
+            orient='vertical',
+            command=self.tournament_tree.yview
+        )
+        self.tournament_tree.configure(yscrollcommand=tournament_scroll.set)
+        
+        # Pack tournament tree and scrollbar
+        self.tournament_tree.pack(side='left', fill='both', expand=True)
+        tournament_scroll.pack(side='right', fill='y')
+        
+        # Create tournament log
+        log_frame = ttk.LabelFrame(tournament_frame, text='Tournament Log')
+        log_frame.pack(fill='x', padx=5, pady=5)
+        
+        self.tournament_log = tk.Text(log_frame, height=4, wrap='word')
+        log_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.tournament_log.yview)
+        self.tournament_log.configure(yscrollcommand=log_scroll.set)
+        
+        self.tournament_log.pack(side='left', fill='both', expand=True)
+        log_scroll.pack(side='right', fill='y')
 
-    def _save_tab_order(self, auto_save=True):
-        """Save current tab order to settings"""
+    def _create_tournament(self):
+        """Create a new tournament bracket"""
         try:
-            if not hasattr(self, 'settings'):
-                self.settings = {}
-                
-            tab_order = []
-            for tab in self.notebook.tabs():
-                try:
-                    tab_text = self.notebook.tab(tab, "text")
-                    if tab_text:  # Only add valid tab texts
-                        tab_order.append(tab_text)
-                except tk.TclError:
-                    continue
+            # Get enabled characters - check both settings and current state
+            enabled_chars = []
             
-            self.settings["tab_order"] = tab_order
+            # Get all items from character tree
+            for item in self.char_tree.get_children():
+                values = self.char_tree.item(item)['values']
+                char_name = values[0]  # Character name is in first column
+                enabled = values[-1]   # Enabled status is in last column
+                if enabled == '✓':     # Check for checkmark
+                    enabled_chars.append(char_name)
             
-            # Auto-save if enabled and requested
-            if auto_save and hasattr(self, 'autosave_var') and self.autosave_var.get():
-                self.save_config()
+            # Update settings to match current state
+            self.manager.settings["enabled_chars"] = set(enabled_chars)
+            
+            if not enabled_chars:
+                messagebox.showerror("Error", "No characters enabled! Enable at least two characters.")
+                return
                 
+            if len(enabled_chars) < 2:
+                messagebox.showerror("Error", "Not enough characters! Enable at least two characters.")
+                return
+
+            # Get tournament settings
+            bracket_size = self.bracket_size_var.get()
+            tournament_mode = self.tournament_mode_var.get()
+            
+            # Validate bracket size
+            if bracket_size > len(enabled_chars):
+                messagebox.showerror("Error", f"Not enough characters for {bracket_size}-player tournament! Enable more characters or reduce bracket size.")
+                return
+                
+            # Randomly select characters if needed
+            if bracket_size < len(enabled_chars):
+                tournament_chars = random.sample(enabled_chars, bracket_size)
+            else:
+                tournament_chars = enabled_chars.copy()
+                
+            # Shuffle the characters
+            random.shuffle(tournament_chars)
+            
+            # Calculate number of rounds
+            num_rounds = (bracket_size - 1).bit_length()  # log2 ceiling
+            
+            # Create tournament structure
+            self.tournament_data = {
+                'mode': tournament_mode,
+                'bracket_size': bracket_size,
+                'current_round': 1,
+                'total_rounds': num_rounds,
+                'matches': [],
+                'winners': [],
+                'active_match': None
+            }
+            
+            # Create first round matches
+            matches = []
+            for i in range(0, len(tournament_chars), 2):
+                if i + 1 < len(tournament_chars):
+                    matches.append({
+                        'round': 1,
+                        'p1': tournament_chars[i],
+                        'p2': tournament_chars[i + 1],
+                        'winner': None,
+                        'completed': False
+                    })
+                else:
+                    # Handle bye matches for odd numbers
+                    matches.append({
+                        'round': 1,
+                        'p1': tournament_chars[i],
+                        'p2': None,  # Bye
+                        'winner': tournament_chars[i],
+                        'completed': True
+                    })
+            
+            self.tournament_data['matches'] = matches
+            
+            # Clear and populate tournament tree
+            for item in self.tournament_tree.get_children():
+                self.tournament_tree.delete(item)
+                
+            # Add matches to tree
+            for i, match in enumerate(matches, 1):
+                p1 = match['p1'] if match['p1'] else "BYE"
+                p2 = match['p2'] if match['p2'] else "BYE"
+                self.tournament_tree.insert('', 'end', values=(
+                    f"Round 1 - Match {i}",
+                    p1,
+                    p2,
+                    match['winner'] if match['winner'] else "Pending"
+                ))
+            
+            # Enable tournament controls
+            self.start_tournament_btn.config(state='normal')
+            self.reset_tournament_btn.config(state='normal')
+            
+            # Log tournament creation
+            if hasattr(self, 'battle_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Created {bracket_size}-player tournament in {tournament_mode} mode\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+            
+            messagebox.showinfo("Success", f"Created {bracket_size}-player tournament!")
+
         except Exception as e:
-            print(f"Error saving tab order: {e}")
+            messagebox.showerror("Error", f"Failed to create tournament: {str(e)}")
+            print(f"Error creating tournament: {e}")
+            traceback.print_exc()
+            
+            # Reset tournament data
+            self.tournament_data = None
+            
+            # Disable tournament controls
+            self.start_tournament_btn.config(state='disabled')
+            self.reset_tournament_btn.config(state='disabled')
+
+    def _start_tournament(self):
+        """Start or continue tournament matches"""
+        try:
+            # Validate tournament data exists
+            if not hasattr(self, 'tournament_data') or not self.tournament_data:
+                messagebox.showerror("Error", "No tournament created! Create a tournament first.")
+                return
+                
+            # Check if a battle is already in progress
+            if hasattr(self, 'battle_monitor') and self.battle_monitor:
+                messagebox.showwarning("Warning", "A battle is already in progress!")
+                return
+                
+            # Check if tournament is complete
+            if self.tournament_data['current_round'] > self.tournament_data['total_rounds']:
+                messagebox.showinfo("Tournament Complete", "Tournament is finished!")
+                return
+                
+            # Find next unfinished match
+            current_match = None
+            for match in self.tournament_data['matches']:
+                if match['round'] == self.tournament_data['current_round'] and not match['completed']:
+                    current_match = match
+                    break
+                    
+            if not current_match:
+                # All matches in current round complete, advance to next round
+                self.tournament_data['current_round'] += 1
+                self._create_next_round_matches()
+                return
+                
+            # Set active match
+            self.tournament_data['active_match'] = current_match
+            
+            # Prepare battle information
+            battle_info = {
+                'mode': self.tournament_data['mode'],
+                'p1': current_match['p1'],
+                'p2': current_match['p2'],
+                'stage': random.choice(list(self.manager.settings["enabled_stages"]))
+            }
+            
+            # Update preview tab
+            self._update_preview_tab(battle_info)
+            
+            # Start the battle
+            self.manager.start_battle(battle_info)
+            
+            # Start monitoring battle
+            self.battle_monitor = self.root.after(1000, self._check_tournament_battle)
+            
+            # Log match start
+            if hasattr(self, 'battle_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Tournament Round {self.tournament_data['current_round']} - {battle_info['p1']} vs {battle_info['p2']}\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start tournament match: {str(e)}")
+            print(f"Error starting tournament match: {e}")
+            traceback.print_exc()
+            
+            # Reset battle monitor
+            if hasattr(self, 'battle_monitor') and self.battle_monitor:
+                self.root.after_cancel(self.battle_monitor)
+                self.battle_monitor = None
+
+    def _check_tournament_battle(self):
+        """Check the result of the current tournament battle"""
+        try:
+            if not self.tournament_data or not self.tournament_data['active_match']:
+                return
+                
+            result = self.manager.check_battle_result()
+            if not result:
+                # Battle still ongoing, check again in 1 second
+                self.battle_monitor = self.root.after(1000, self._check_tournament_battle)
+                return
+                
+            # Process battle result
+            winner = result['winner']
+            active_match = self.tournament_data['active_match']
+            
+            # Update match data
+            active_match['winner'] = winner
+            active_match['completed'] = True
+            
+            # Update tournament tree
+            for item in self.tournament_tree.get_children():
+                values = self.tournament_tree.item(item)['values']
+                if values[1] == active_match['p1'] and values[2] == active_match['p2']:
+                    self.tournament_tree.item(item, values=(
+                        values[0],  # Round/Match info
+                        values[1],  # P1
+                        values[2],  # P2
+                        winner      # Winner
+                    ))
+                    break
+            
+            # Log match result
+            if hasattr(self, 'tournament_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Tournament Match Result: {winner} wins!\n"
+                self.tournament_log.insert(tk.END, log_text)
+                self.tournament_log.see(tk.END)
+            
+            # Clear battle monitor and active match
+            self.battle_monitor = None
+            self.tournament_data['active_match'] = None
+            
+            # Check if current round is complete
+            current_round = self.tournament_data['current_round']
+            current_matches = [m for m in self.tournament_data['matches'] 
+                             if m['round'] == current_round]
+            
+            all_complete = all(m['completed'] for m in current_matches)
+            
+            if all_complete:
+                if current_round == self.tournament_data['total_rounds']:
+                    # Tournament complete
+                    messagebox.showinfo("Tournament Complete", f"Tournament Winner: {winner}!")
+                    self.tournament_data = None
+                    self.start_tournament_btn.config(state='disabled')
+                    self.reset_tournament_btn.config(state='disabled')
+                else:
+                    # Log round completion
+                    if hasattr(self, 'tournament_log'):
+                        timestamp = time.strftime("%H:%M:%S")
+                        log_text = f"[{timestamp}] Round {current_round} complete! Starting Round {current_round + 1}\n"
+                        self.tournament_log.insert(tk.END, log_text)
+                        self.tournament_log.see(tk.END)
+                    
+                    # Advance to next round
+                    self.tournament_data['current_round'] += 1
+                    self.root.after(2000, self._create_next_round_matches)
+            else:
+                # Continue with next match in current round
+                self.root.after(2000, self._start_tournament)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to check tournament battle: {str(e)}")
+            print(f"Error checking tournament battle: {e}")
+            traceback.print_exc()
+            
+            # Clear battle monitor on error
+            self.battle_monitor = None
+            if self.tournament_data:
+                self.tournament_data['active_match'] = None
+
+    def _create_next_round_matches(self):
+        """Create matches for the next tournament round"""
+        try:
+            current_round = self.tournament_data['current_round']
+            
+            # Get winners from previous round
+            previous_matches = [m for m in self.tournament_data['matches'] 
+                             if m['round'] == current_round - 1 and m['completed']]
+            
+            if not previous_matches:
+                messagebox.showerror("Error", "No completed matches found from previous round!")
+                return
+                
+            # Clear existing matches for the current round (prevent duplicates)
+            self.tournament_data['matches'] = [m for m in self.tournament_data['matches'] 
+                                             if m['round'] != current_round]
+            
+            # Create new matches from winners of previous round
+            new_matches = []
+            for i in range(0, len(previous_matches), 2):
+                p1 = previous_matches[i]['winner']
+                p2 = previous_matches[i + 1]['winner'] if i + 1 < len(previous_matches) else None
+                
+                new_match = {
+                    'round': current_round,
+                    'p1': p1,
+                    'p2': p2,
+                    'winner': None,
+                    'completed': False if p2 else True  # Auto-complete if bye
+                }
+                
+                if not p2:  # Handle bye
+                    new_match['winner'] = p1
+                
+                new_matches.append(new_match)
+            
+            # Add new matches to tournament data
+            self.tournament_data['matches'].extend(new_matches)
+            
+            # Update tournament tree
+            # First remove all matches from current round
+            for item in self.tournament_tree.get_children():
+                values = self.tournament_tree.item(item)['values']
+                if values[0].startswith(f"Round {current_round}"):
+                    self.tournament_tree.delete(item)
+            
+            # Add new matches
+            for i, match in enumerate(new_matches, 1):
+                self.tournament_tree.insert('', 'end', values=(
+                    f"Round {current_round} - Match {i}",
+                    match['p1'],
+                    match['p2'] if match['p2'] else "BYE",
+                    match['winner'] if match['winner'] else "Pending"
+                ))
+            
+            # Log round start
+            if hasattr(self, 'tournament_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Starting Round {current_round}\n"
+                self.tournament_log.insert(tk.END, log_text)
+                self.tournament_log.see(tk.END)
+            
+            # Start next match if there are actual matches (not just byes)
+            if any(not m['completed'] for m in new_matches):
+                self.root.after(2000, self._start_tournament)
+            elif current_round == self.tournament_data['total_rounds']:
+                # Tournament complete with final bye
+                winner = new_matches[0]['winner']
+                messagebox.showinfo("Tournament Complete", f"Tournament Winner: {winner}!")
+                self.tournament_data = None
+                self.start_tournament_btn.config(state='disabled')
+                self.reset_tournament_btn.config(state='disabled')
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create next round: {str(e)}")
+            print(f"Error creating next round: {e}")
             traceback.print_exc()
 
-    def _load_tab_order(self):
-        """Load and apply saved tab order"""
+    def _reset_tournament(self):
+        """Reset the tournament to initial state"""
         try:
-            if "tab_order" in self.settings:
-                saved_order = self.settings["tab_order"]
-                current_tabs = {}
-                
-                # Create mapping of tab text to index
-                for i in range(self.notebook.index('end')):
-                    text = self.notebook.tab(i, "text")
-                    current_tabs[text] = i
-                
-                # Reorder tabs according to saved order
-                for i, tab_text in enumerate(saved_order):
-                    if tab_text in current_tabs:
-                        current_index = current_tabs[tab_text]
-                        if current_index != i:
-                            self._move_tab(current_index, i)
-        except Exception as e:
-            print(f"Error loading tab order: {e}")
-
-    def _setup_preview_tab(self):
-        """Setup the battle preview tab"""
-        # Configure the preview tab with black background
-        self.preview_tab.configure(style="Preview.TFrame")
-        style = ttk.Style()
-        style.configure("Preview.TFrame", background="black")
-
-        # Main display frame
-        self.preview_display = tk.Frame(self.preview_tab, bg="black")
-        self.preview_display.pack(expand=True, fill="both")
-
-        # Create frames for fighters/teams
-        self.preview_left_frame = tk.Frame(self.preview_display, bg="black", width=400)
-        self.preview_left_frame.pack(side="left", fill="y", padx=20)
-        self.preview_left_frame.pack_propagate(False)
-
-        # VS display in center
-        self.preview_vs_frame = tk.Frame(self.preview_display, bg="black")
-        self.preview_vs_frame.pack(side="left", expand=True, fill="both")
-        self.preview_vs_label = tk.Label(
-            self.preview_vs_frame,
-            text="VS",
-            font=("Impact", 120),
-            fg="white",
-            bg="black"
-        )
-        self.preview_vs_label.pack(expand=True)
-
-        self.preview_right_frame = tk.Frame(self.preview_display, bg="black", width=400)
-        self.preview_right_frame.pack(side="right", fill="y", padx=20)
-        self.preview_right_frame.pack_propagate(False)
-
-        # Bottom frame for betting info
-        self.preview_bottom = tk.Frame(self.preview_tab, bg="black")
-        self.preview_bottom.pack(side="bottom", fill="x")
-
-        # Status banner
-        self.preview_status = tk.Frame(self.preview_bottom, bg="black", height=50)
-        self.preview_status.pack(fill="x", pady=(0, 2))
-        self.preview_status.pack_propagate(False)
-        
-        self.preview_status_label = tk.Label(
-            self.preview_status,
-            text="WAITING FOR BATTLE",
-            font=("Arial Black", 32, "bold"),
-            bg="black",
-            fg="white"
-        )
-        self.preview_status_label.pack(expand=True)
-
-        # Betting info bar
-        self.preview_betting = tk.Frame(self.preview_bottom, bg="black", height=50)
-        self.preview_betting.pack(fill="x")
-        self.preview_betting.pack_propagate(False)
-
-        # Team 1 total (left)
-        self.preview_team1_total = tk.Label(
-            self.preview_betting,
-            text="0",
-            font=("Arial Black", 28, "bold"),
-            fg="#FF0000",
-            bg="black"
-        )
-        self.preview_team1_total.pack(side="left", expand=True)
-
-        # Timer (center)
-        self.preview_timer = tk.Label(
-            self.preview_betting,
-            text="",
-            font=("Arial Black", 28, "bold"),
-            fg="white",
-            bg="black"
-        )
-        self.preview_timer.pack(side="left", expand=True)
-
-        # Team 2 total (right)
-        self.preview_team2_total = tk.Label(
-            self.preview_betting,
-            text="0",
-            font=("Arial Black", 28, "bold"),
-            fg="#0000FF",
-            bg="black"
-        )
-        self.preview_team2_total.pack(side="right", expand=True)
-
-        # Start the betting timer
-        self._update_betting_timer(self.betting_duration)
-
-        # Update bet totals periodically
-        self._update_bet_totals()
-
-    def _update_bet_totals(self):
-        """Update the bet totals display"""
-        try:
-            if self.twitch_bot:
-                team1_total = sum(self.twitch_bot.current_bets["1"].values())
-                team2_total = sum(self.twitch_bot.current_bets["2"].values())
-                
-                # Update preview tab totals
-                if hasattr(self, 'preview_team1_total'):
-                    self.preview_team1_total.config(text=f"{team1_total:,}")
-                if hasattr(self, 'preview_team2_total'):
-                    self.preview_team2_total.config(text=f"{team2_total:,}")
-                
-                # Schedule next update
-                self.root.after(1000, self._update_bet_totals)
-                
-        except Exception as e:
-            print(f"Error updating bet totals: {e}")
-
-    def _create_fighter_display(self, parent, fighter, team_name, side):
-        """Create a single fighter display"""
-        frame = ttk.Frame(parent, style="Dark.TFrame")
-        frame.pack(expand=True, fill="both")
-
-        # Team name with colored background
-        team_bg = "#ff3366" if side == "left" else "#3366ff"
-        team_frame = tk.Frame(frame, bg=team_bg)
-        team_frame.pack(fill="x", pady=(0, 10))
-        ttk.Label(team_frame, text=team_name, style="Name.TLabel").pack(pady=5)
-
-        # Portrait with placeholder
-        portrait_path = self.manager.chars_path / fighter / "portrait.png"
-        try:
-            if portrait_path.exists():
-                img = Image.open(portrait_path)
-                img.thumbnail((300, 300))  # Larger portraits
-                photo = ImageTk.PhotoImage(img)
-            else:
-                photo = self.placeholder_portrait
-        except Exception as e:
-            print(f"Error loading portrait for {fighter}: {e}")
-            photo = self.placeholder_portrait
-
-        portrait_label = ttk.Label(frame, image=photo)
-        portrait_label.image = photo
-        portrait_label.pack(pady=10)
-
-        # Fighter name
-        ttk.Label(frame, text=fighter, style="Name.TLabel").pack()
-
-        # Stats
-        stats = self.manager.character_stats.get(fighter, {"wins": 0, "losses": 0})
-        total_matches = stats["wins"] + stats["losses"]
-        win_rate = f"{(stats['wins']/total_matches)*100:.1f}%" if total_matches > 0 else "No matches"
-        
-        stats_text = f"Wins: {stats['wins']} | Losses: {stats['losses']}\nWin Rate: {win_rate}"
-        ttk.Label(frame, text=stats_text, style="Stats.TLabel").pack(pady=5)
-
-    def _create_team_display(self, parent, team, team_name, side):
-        """Create a team display"""
-        frame = ttk.Frame(parent, style="Dark.TFrame")
-        frame.pack(expand=True, fill="both")
-
-        # Team name with colored background
-        team_bg = "#ff3366" if side == "left" else "#3366ff"
-        team_frame = tk.Frame(frame, bg=team_bg)
-        team_frame.pack(fill="x", pady=(0, 10))
-        ttk.Label(team_frame, text=team_name, style="Name.TLabel").pack(pady=5)
-
-        # Calculate team stats
-        total_wins = sum(self.manager.character_stats.get(fighter, {"wins": 0})["wins"] for fighter in team)
-        total_matches = sum(
-            self.manager.character_stats.get(fighter, {"wins": 0, "losses": 0})["wins"] + 
-            self.manager.character_stats.get(fighter, {"wins": 0, "losses": 0})["losses"] 
-            for fighter in team
-        )
-        win_rate = f"{(total_wins/total_matches)*100:.1f}%" if total_matches > 0 else "No matches"
-        ttk.Label(frame, text=f"Team Win Rate: {win_rate}", style="Stats.TLabel").pack()
-
-        # Create a grid of fighter portraits
-        grid_frame = ttk.Frame(frame, style="Dark.TFrame")
-        grid_frame.pack(pady=10)
-        
-        row = 0
-        col = 0
-        for fighter in team:
-            fighter_frame = ttk.Frame(grid_frame, style="Dark.TFrame")
-            fighter_frame.grid(row=row, column=col, padx=5, pady=5)
+            # Clear tournament tree
+            for item in self.tournament_tree.get_children():
+                self.tournament_tree.delete(item)
             
-            # Portrait
-            portrait_path = self.manager.chars_path / fighter / "portrait.png"
-            try:
-                if portrait_path.exists():
-                    img = Image.open(portrait_path)
-                    img.thumbnail((150, 150))  # Smaller for team display
-                    photo = ImageTk.PhotoImage(img)
+            # Reset tournament data
+            self.tournament_data = None
+            
+            # Reset button states
+            self.start_tournament_btn.config(state='disabled')
+            self.reset_tournament_btn.config(state='disabled')
+            
+            # Log reset
+            if hasattr(self, 'tournament_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Tournament reset\n"
+                self.tournament_log.insert(tk.END, log_text)
+                self.tournament_log.see(tk.END)
+            
+            # Enable tournament creation
+            self.create_tournament_btn.config(state='normal')
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to check battle result: {str(e)}")
+            print(f"Error checking battle result: {e}")
+            traceback.print_exc()
+            
+            # Clear battle monitor on error
+            self.battle_monitor = None
+            
+            # Enable controls
+            if hasattr(self, 'start_tournament_btn'):
+                self.start_tournament_btn.config(state='normal')
+            if hasattr(self, 'start_battle_btn'):
+                self.start_battle_btn.config(state='normal')
+
+    def _quick_rematch(self):
+        """Start a rematch using the same characters and stage"""
+        try:
+            # Check if there's a previous battle to rematch
+            if not hasattr(self, 'prepared_battle_info') or not self.prepared_battle_info:
+                messagebox.showwarning("Warning", "No previous battle to rematch!")
+                return
+
+            # Check if a battle is already running
+            if self.battle_monitor:
+                messagebox.showwarning("Warning", "A battle is already in progress!")
+                return
+
+            # Store the previous battle info
+            previous_battle = self.prepared_battle_info.copy()
+
+            # Update preview tab with battle info
+            self._update_preview_tab(previous_battle)
+
+            # If Twitch bot is connected and active, start betting period
+            if hasattr(self, 'twitch_bot') and self.twitch_bot and self.twitch_bot.connected:
+                # Format battle title based on mode
+                if previous_battle['mode'] == "single":
+                    title = f"REMATCH: {previous_battle['p1']} vs {previous_battle['p2']}"
+                    team1 = previous_battle['p1']
+                    team2 = previous_battle['p2']
                 else:
-                    photo = self.placeholder_portrait
-            except Exception as e:
-                print(f"Error loading portrait for {fighter}: {e}")
-                photo = self.placeholder_portrait
+                    team1 = " & ".join(previous_battle['p1'])
+                    team2 = " & ".join(previous_battle['p2'])
+                    title = f"REMATCH: Team {team1} vs Team {team2}"
 
-            portrait_label = ttk.Label(fighter_frame, image=photo)
-            portrait_label.image = photo
-            portrait_label.pack()
-
-            # Fighter name
-            ttk.Label(fighter_frame, text=fighter, style="Stats.TLabel").pack()
-            
-            # Update grid position
-            col += 1
-            if col > 1:  # 2 columns
-                col = 0
-                row += 1
-
-    def _update_betting_timer(self, remaining):
-        """Update betting timer and start battle when done"""
-        try:
-            if remaining > 0:
-                # Update timer text
-                timer_text = f"Betting closes in: {remaining} seconds"
+                # Start betting period
+                betting_duration = self.betting_duration_var.get()
+                asyncio.run_coroutine_threadsafe(
+                    self.twitch_bot.create_battle_poll(title, team1, team2, betting_duration),
+                    self.twitch_bot.loop
+                )
                 
-                # Update timer in preview tab
-                if hasattr(self, 'preview_timer'):
-                    self.preview_timer.config(text=timer_text)
-                
-                # Schedule next update
-                self.root.after(1000, lambda: self._update_betting_timer(remaining - 1))
+                # Start betting timer
+                self._update_betting_timer(betting_duration)
             else:
-                # End betting poll
-                if self.twitch_bot and self.twitch_bot.betting_active:
-                    asyncio.run_coroutine_threadsafe(
-                        self.twitch_bot.end_poll(),
-                        self.twitch_bot.loop
-                    )
+                # Start battle immediately if no Twitch integration
+                self.prepared_battle_info = previous_battle
+                self._start_actual_battle()
+
+            # Log rematch
+            if hasattr(self, 'battle_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Starting rematch...\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start rematch: {str(e)}")
+            print(f"Error starting rematch: {e}")
+            traceback.print_exc()
+
+    def _force_next_round(self):
+        """Force the current battle to proceed to the next round"""
+        try:
+            # Check if a battle is running
+            if not self.battle_monitor:
+                messagebox.showwarning("Warning", "No battle in progress!")
+                return
+
+            # Check if MUGEN is running
+            if not self.manager._check_mugen_running():
+                messagebox.showwarning("Warning", "MUGEN is not running!")
+                return
+
+            # Try to force the next round by simulating a round end
+            try:
+                # Kill the current MUGEN process
+                subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
+                time.sleep(0.5)  # Wait for process cleanup
                 
-                # Update preview tab status
-                if hasattr(self, 'preview_timer'):
-                    self.preview_timer.config(text="BATTLE STARTING!")
+                # Restart the battle with the same info
+                if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
+                    self._start_actual_battle()
+                    
+                    # Log the forced round
+                    if hasattr(self, 'battle_log'):
+                        timestamp = time.strftime("%H:%M:%S")
+                        log_text = f"[{timestamp}] Forced next round\n"
+                        self.battle_log.insert(tk.END, log_text)
+                        self.battle_log.see(tk.END)
+                else:
+                    messagebox.showerror("Error", "No battle information available!")
+                    
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to force next round: {str(e)}")
+                print(f"Error forcing next round: {e}")
+                traceback.print_exc()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to force next round: {str(e)}")
+            print(f"Error in force_next_round: {e}")
+            traceback.print_exc()
+
+    def _reset_battle_scores(self):
+        """Reset all battle scores and statistics"""
+        try:
+            # Confirm with user before resetting
+            if not messagebox.askyesno("Confirm Reset", 
+                "Are you sure you want to reset all battle scores and statistics? This cannot be undone."):
+                return
+
+            # Reset character statistics
+            self.manager.character_stats = {}
+            for char in self.manager.characters:
+                self.manager.character_stats[char] = {
+                    "wins": 0,
+                    "losses": 0,
+                    "matchups": {},
+                    "most_defeated": {},
+                    "most_lost_to": {}
+                }
+
+            # Reset stage statistics
+            self.manager.stage_stats = {}
+            for stage in self.manager.stages:
+                self.manager.stage_stats[stage] = {
+                    "times_used": 0,
+                    "last_used": "Never",
+                    "total_duration": 0
+                }
+
+            # Reset battle durations
+            self.manager.battle_durations = []
+
+            # Reset battle history
+            self.manager.battle_history = {
+                "battles": [],
+                "last_save": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            # Save the reset stats
+            self.manager.save_stats()
+            self.manager.save_battle_history()
+
+            # Update the UI
+            self._update_stats_view()
+
+            # Log the reset
+            if hasattr(self, 'battle_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Reset all battle scores and statistics\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+
+            messagebox.showinfo("Success", "All battle scores and statistics have been reset!")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to reset scores: {str(e)}")
+            print(f"Error resetting scores: {e}")
+            traceback.print_exc()
+
+    def _change_random_stage(self):
+        """Change to a random stage during battle"""
+        try:
+            # Check if a battle is in progress
+            if not self.battle_monitor:
+                messagebox.showwarning("Warning", "No battle in progress!")
+                return
+
+            # Check if there are enabled stages
+            enabled_stages = list(self.manager.settings["enabled_stages"])
+            if not enabled_stages:
+                messagebox.showerror("Error", "No stages enabled! Enable at least one stage.")
+                return
+
+            # Select a random stage
+            new_stage = random.choice(enabled_stages)
+            
+            # Update battle info
+            if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
+                self.prepared_battle_info['stage'] = new_stage
                 
-                # Start the actual battle
+                # Restart the battle with new stage
                 self._start_actual_battle()
                 
+                # Log the stage change
+                if hasattr(self, 'battle_log'):
+                    timestamp = time.strftime("%H:%M:%S")
+                    log_text = f"[{timestamp}] Changed stage to: {new_stage}\n"
+                    self.battle_log.insert(tk.END, log_text)
+                    self.battle_log.see(tk.END)
+            else:
+                messagebox.showerror("Error", "No battle information available!")
+
         except Exception as e:
-            print(f"Timer update error: {e}")
+            messagebox.showerror("Error", f"Failed to change stage: {str(e)}")
+            print(f"Error changing stage: {e}")
             traceback.print_exc()
 
-    def _start_actual_battle(self):
-        """Start the actual battle with prepared info"""
+    def _toggle_ai_level(self):
+        """Toggle AI difficulty level"""
         try:
-            # Check if battle is already running
-            if self.battle_monitor:
-                print("Battle already in progress, skipping start")
+            # Check if a battle is in progress
+            if not self.battle_monitor:
+                messagebox.showwarning("Warning", "No battle in progress!")
                 return
 
-            if not hasattr(self, 'prepared_battle_info') or not self.prepared_battle_info:
-                print("No battle info available")
-                return
+            # Toggle AI level (1-8 are standard MUGEN AI levels)
+            current_level = getattr(self, 'current_ai_level', 1)
+            new_level = current_level + 1 if current_level < 8 else 1
+            self.current_ai_level = new_level
 
-            # Close preview window before starting battle
-            if hasattr(self, 'preview_window') and self.preview_window:
-                try:
-                    self.preview_window.destroy()
-                except:
-                    pass
-                self.preview_window = None
+            # Update battle info with new AI level
+            if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
+                self.prepared_battle_info['ai_level'] = new_level
+                
+                # Restart the battle with new AI level
+                self._start_actual_battle()
+                
+                # Log the AI level change
+                if hasattr(self, 'battle_log'):
+                    timestamp = time.strftime("%H:%M:%S")
+                    log_text = f"[{timestamp}] Changed AI level to: {new_level}\n"
+                    self.battle_log.insert(tk.END, log_text)
+                    self.battle_log.see(tk.END)
+            else:
+                messagebox.showerror("Error", "No battle information available!")
 
-            # Store battle info and clear prepared info to prevent duplicate starts
-            battle_info = self.prepared_battle_info
-            self.prepared_battle_info = None
-
-            print("Starting actual battle with:", battle_info)
-            self.manager.start_battle(battle_info)
-            self.battle_monitor = self.root.after(1000, self._check_battle_result)
-            
         except Exception as e:
-            print(f"Error starting actual battle: {e}")
+            messagebox.showerror("Error", f"Failed to toggle AI level: {str(e)}")
+            print(f"Error toggling AI level: {e}")
             traceback.print_exc()
-            if self.battle_monitor:
-                self.root.after_cancel(self.battle_monitor)
-                self.battle_monitor = None
 
-    def stop_battle(self):
-        """Stop the current battle and clean up"""
+    def _start_battle_after_betting(self):
+        """Force start battle immediately after current betting period"""
         try:
-            # Stop battle monitoring
-            if self.battle_monitor:
-                self.root.after_cancel(self.battle_monitor)
-                self.battle_monitor = None
-
-            # Close preview window if open
-            if hasattr(self, 'preview_window') and self.preview_window:
-                try:
-                    self.preview_window.destroy()
-                except:
-                    pass
-                self.preview_window = None
-
-            # End Twitch poll if active
-            if self.twitch_bot and self.twitch_bot.betting_active:
+            # Check if betting is active
+            if hasattr(self, 'twitch_bot') and self.twitch_bot and self.twitch_bot.betting_active:
+                # End betting period
                 asyncio.run_coroutine_threadsafe(
                     self.twitch_bot.end_poll(),
                     self.twitch_bot.loop
                 )
-
-            # Find and terminate MUGEN process
-            try:
-                subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
-                time.sleep(0.5)  # Give process time to terminate
-            except:
-                pass
-
-            # Clean up MugenWatcher
-            if self.manager.watcher_process:
-                try:
-                    self.manager.watcher_process.terminate()
-                    time.sleep(0.5)  # Give process time to terminate
-                    self.manager.watcher_process = None
-                except:
-                    pass
-
-            # Clear all battle states
-            self.manager.current_battle = None
-            self.prepared_battle_info = None
-            self.manager.battle_start_time = None
-            
-            # Reset Twitch betting state
-            if self.twitch_bot:
-                self.twitch_bot.betting_active = False
-                self.twitch_bot.current_bets = {"1": {}, "2": {}}
-
-            # Log battle stop
-            timestamp = time.strftime("%H:%M:%S")
-            if hasattr(self, 'battle_log'):
-                self.battle_log.insert(tk.END, f"[{timestamp}] Battle stopped\n")
-                self.battle_log.see(tk.END)
+                
+                # Start battle immediately
+                self._start_actual_battle()
+                
+                # Log the forced start
+                if hasattr(self, 'battle_log'):
+                    timestamp = time.strftime("%H:%M:%S")
+                    log_text = f"[{timestamp}] Forced battle start after betting\n"
+                    self.battle_log.insert(tk.END, log_text)
+                    self.battle_log.see(tk.END)
+            else:
+                messagebox.showinfo("Info", "No active betting period to end!")
 
         except Exception as e:
-            print(f"Failed to stop battle: {str(e)}")
-            traceback.print_exc()  # Add stack trace for debugging
-            # Try emergency cleanup
-            self.manager.current_battle = None
-            self.prepared_battle_info = None
+            messagebox.showerror("Error", f"Failed to force battle start: {str(e)}")
+            print(f"Error forcing battle start: {e}")
+            traceback.print_exc()
+
+    def _connect_twitch(self):
+        """Connect or disconnect from Twitch chat"""
+        try:
+            if hasattr(self, 'twitch_bot') and self.twitch_bot and self.twitch_bot.connected:
+                # Disconnect if already connected
+                if hasattr(self.twitch_bot, 'loop') and self.twitch_bot.loop:
+                    self.twitch_bot.loop.stop()
+                self.twitch_bot = None
+                self.update_twitch_status(False)
+                messagebox.showinfo("Success", "Disconnected from Twitch chat")
+                return
+
+            # Validate Twitch settings
+            token = self.twitch_token_var.get().strip()
+            channel = self.twitch_channel_var.get().strip().lower()
+            bot_name = self.twitch_botname_var.get().strip().lower()
+
+            if not all([token, channel, bot_name]):
+                messagebox.showerror("Error", "Please fill in all Twitch settings (Token, Channel, Bot Name)")
+                return
+
+            try:
+                # Create and initialize Twitch bot
+                self.twitch_bot = TwitchBot(
+                    token=token,
+                    channel=channel,
+                    battle_gui=self,
+                    bot_name=bot_name
+                )
+
+                # Start bot in a separate thread
+                def run_bot():
+                    try:
+                        self.twitch_bot.run()
+                    except Exception as e:
+                        print(f"Twitch bot error: {e}")
+                        messagebox.showerror("Error", f"Twitch bot error: {str(e)}")
+                        self.twitch_bot = None
+                        self.update_twitch_status(False)
+
+                threading.Thread(target=run_bot, daemon=True).start()
+
+                # Save Twitch settings
+                self.save_config()
+
+                messagebox.showinfo("Success", f"Connected to Twitch channel: {channel}")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to connect to Twitch: {str(e)}")
+                self.twitch_bot = None
+                self.update_twitch_status(False)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to handle Twitch connection: {str(e)}")
+            print(f"Error handling Twitch connection: {e}")
+            traceback.print_exc()
+            self.update_twitch_status(False)
+
+    def stop_battle(self):
+        """Stop the current battle"""
+        if self.battle_monitor:
+            self.root.after_cancel(self.battle_monitor)
             self.battle_monitor = None
+        
+        if self.current_battle:
+            self.current_battle = None
+            
+        self.manager.stop_battle()
 
     def update_twitch_status(self, connected: bool):
         """Update Twitch connection status in GUI"""
@@ -2063,44 +2418,50 @@ class BattleGUI:
     def _update_preview_tab(self, battle_info):
         """Update the preview tab with battle information"""
         try:
-            # Clear existing content
+            # Clear existing preview display
             for widget in self.preview_display.winfo_children():
                 widget.destroy()
 
-            # Create frames for fighters/teams
-            left_frame = tk.Frame(self.preview_display, bg="black", width=400)
-            left_frame.pack(side="left", fill="y", padx=20)
-            left_frame.pack_propagate(False)
+            # Create new team frames
+            team1_frame = ttk.Frame(self.preview_display, style="Preview.TFrame")
+            team1_frame.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
-            # VS display in center
-            vs_frame = tk.Frame(self.preview_display, bg="black")
-            vs_frame.pack(side="left", expand=True, fill="both")
-            tk.Label(
-                vs_frame,
-                text="VS",
-                font=("Impact", 120),
-                fg="white",
-                bg="black"
-            ).pack(expand=True)
+            vs_frame = ttk.Frame(self.preview_display, style="Preview.TFrame")
+            vs_frame.pack(side=tk.LEFT, padx=20)
+            ttk.Label(vs_frame, text="VS", style="Name.TLabel").pack(pady=5)
 
-            right_frame = tk.Frame(self.preview_display, bg="black", width=400)
-            right_frame.pack(side="right", fill="y", padx=20)
-            right_frame.pack_propagate(False)
+            team2_frame = ttk.Frame(self.preview_display, style="Preview.TFrame")
+            team2_frame.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH)
 
-            # Create fighter displays
+            # Display fighters based on battle mode
             if battle_info['mode'] == "single":
-                self._create_fighter_display(left_frame, battle_info['p1'], "RED TEAM", "left")
-                self._create_fighter_display(right_frame, battle_info['p2'], "BLUE TEAM", "right")
+                self._create_fighter_display(team1_frame, battle_info['p1'], "Player 1", "left")
+                self._create_fighter_display(team2_frame, battle_info['p2'], "Player 2", "right")
             else:
-                self._create_team_display(left_frame, battle_info['p1'], "RED TEAM", "left")
-                self._create_team_display(right_frame, battle_info['p2'], "BLUE TEAM", "right")
+                self._create_team_display(team1_frame, battle_info['p1'], "Team 1", "left")
+                self._create_team_display(team2_frame, battle_info['p2'], "Team 2", "right")
+
+            # Update stage preview
+            stage_path = self.manager.stages_path / battle_info['stage'] / "preview.png"
+            try:
+                if stage_path.exists():
+                    img = Image.open(stage_path)
+                    img.thumbnail((400, 225))  # 16:9 aspect ratio
+                    photo = ImageTk.PhotoImage(img)
+                    self.stage_preview.configure(image=photo)
+                    self.stage_preview.image = photo
+            except Exception as e:
+                print(f"Error loading stage preview: {e}")
+                self.stage_preview.configure(image=self.placeholder_stage)
+                self.stage_preview.image = self.placeholder_stage
 
         except Exception as e:
             print(f"Error updating preview tab: {e}")
+            traceback.print_exc()
 
     def _setup_battle_tab(self):
         """Setup the battle tab with all controls"""
-        battle_frame = ttk.Frame(self.battle_tab)
+        battle_frame = ttk.Frame(self.tabs["Battle"])
         battle_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Top control panel
@@ -2280,7 +2641,7 @@ class BattleGUI:
 
     def _setup_characters_tab(self):
         # Create search and filter frame
-        filter_frame = ttk.LabelFrame(self.characters_tab, text="Search & Filter")
+        filter_frame = ttk.LabelFrame(self.tabs["Characters"], text="Search & Filter")
         filter_frame.pack(fill="x", padx=5, pady=5)
 
         # Search
@@ -2311,7 +2672,7 @@ class BattleGUI:
                            command=self._filter_characters).pack(side="left", padx=5)
 
         # Character list with checkboxes
-        list_frame = ttk.Frame(self.characters_tab)
+        list_frame = ttk.Frame(self.tabs["Characters"])
         list_frame.pack(expand=True, fill="both", padx=5, pady=5)
 
         # Create Treeview for characters
@@ -2338,7 +2699,7 @@ class BattleGUI:
         self._populate_character_list()
 
         # Quick selection buttons
-        selection_frame = ttk.Frame(self.characters_tab)
+        selection_frame = ttk.Frame(self.tabs["Characters"])
         selection_frame.pack(fill="x", padx=5, pady=5)
         
         ttk.Button(selection_frame, text="Select All", 
@@ -2351,7 +2712,7 @@ class BattleGUI:
     def _setup_stages_tab(self):
         """Setup the stages management tab"""
         # Create search and filter frame
-        filter_frame = ttk.LabelFrame(self.stages_tab, text="Search & Filter")
+        filter_frame = ttk.LabelFrame(self.tabs["Stages"], text="Search & Filter")
         filter_frame.pack(fill="x", padx=5, pady=5)
 
         # Search
@@ -2365,7 +2726,7 @@ class BattleGUI:
         search_entry.pack(side="left", fill="x", expand=True, padx=5)
 
         # Stage list with usage statistics
-        list_frame = ttk.Frame(self.stages_tab)
+        list_frame = ttk.Frame(self.tabs["Stages"])
         list_frame.pack(expand=True, fill="both", padx=5, pady=5)
 
         # Create Treeview for stages
@@ -2392,7 +2753,7 @@ class BattleGUI:
         self._populate_stage_list()
 
         # Quick selection buttons
-        selection_frame = ttk.Frame(self.stages_tab)
+        selection_frame = ttk.Frame(self.tabs["Stages"])
         selection_frame.pack(fill="x", padx=5, pady=5)
         
         ttk.Button(selection_frame, text="Select All", 
@@ -2445,20 +2806,42 @@ class BattleGUI:
                 ))
 
     def _sort_stages(self, column):
-        """Sort stages by the selected column"""
-        items = [(self.stage_tree.set(item, column), item) for item in self.stage_tree.get_children("")]
-        
-        # Sort items
-        items.sort(reverse=self.stage_tree.heading(column).get("reverse", False))
-        
-        # Rearrange items in sorted positions
-        for index, (_, item) in enumerate(items):
-            self.stage_tree.move(item, "", index)
-        
-        # Reverse sort next time
-        self.stage_tree.heading(column, 
-                              command=lambda: self._sort_stages(column),
-                              reverse=not self.stage_tree.heading(column).get("reverse", False))
+        """Sort stage list by column"""
+        try:
+            # Get current sort column and order
+            current_sort = getattr(self, '_stage_sort_column', None)
+            current_order = getattr(self, '_stage_sort_order', 'asc')
+            
+            # Update sort order
+            if current_sort == column:
+                new_order = 'desc' if current_order == 'asc' else 'asc'
+            else:
+                new_order = 'asc'
+            
+            # Store new sort settings
+            self._stage_sort_column = column
+            self._stage_sort_order = new_order
+            
+            # Update column header
+            for col in self.stage_tree['columns']:
+                if col == column:
+                    self.stage_tree.heading(col, text=f"{col} {'↓' if new_order == 'desc' else '↑'}")
+                else:
+                    self.stage_tree.heading(col, text=col)
+            
+            # Get all items
+            item_list = [(self.stage_tree.set(item, column), item) for item in self.stage_tree.get_children('')]
+            
+            # Sort items
+            item_list.sort(reverse=(new_order == 'desc'))
+            
+            # Rearrange items in sorted order
+            for index, (_, item) in enumerate(item_list):
+                self.stage_tree.move(item, '', index)
+
+        except Exception as e:
+            print(f"Error sorting stages: {e}")
+            traceback.print_exc()
 
     def _toggle_stage_status(self, event):
         """Toggle the enabled status of a stage"""
@@ -2498,12 +2881,22 @@ class BattleGUI:
         
         # Add characters
         for char in sorted(self.manager.characters):
+            # Get character stats and calculate win rate
             stats = self.manager.character_stats.get(char, {"wins": 0, "losses": 0})
-            total_matches = stats["wins"] + stats["losses"]
-            win_rate = f"{(stats['wins']/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            total_matches = wins + losses
+            win_rate = f"{(wins/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
+            
+            # Get character tier
             tier = self.manager.get_character_tier(char)
+            if tier == "":  # Handle empty tier case
+                tier = "Unranked"
+                
+            # Get enabled status
             enabled = "✓" if char in self.manager.settings["enabled_characters"] else "✗"
             
+            # Insert character data
             self.char_tree.insert("", "end", values=(
                 char,
                 tier,
@@ -2524,16 +2917,23 @@ class BattleGUI:
         
         # Add filtered characters
         for char in sorted(self.manager.characters):
+            # Get character stats and calculate win rate
+            stats = self.manager.character_stats.get(char, {"wins": 0, "losses": 0})
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            total_matches = wins + losses
+            win_rate = f"{(wins/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
+            
+            # Get character tier
             tier = self.manager.get_character_tier(char)
+            if tier == "":  # Handle empty tier case
+                tier = "Unranked"
             
             # Check if character should be shown based on filters
             if (search_text in char.lower() and
                 (tier == "Unranked" and self.show_unranked_var.get() or
-                 tier != "Unranked" and self.tier_filters[tier].get())):
+                 tier != "Unranked" and self.tier_filters.get(tier, tk.BooleanVar(value=True)).get())):
                 
-                stats = self.manager.character_stats.get(char, {"wins": 0, "losses": 0})
-                total_matches = stats["wins"] + stats["losses"]
-                win_rate = f"{(stats['wins']/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
                 enabled = "✓" if char in self.manager.settings["enabled_characters"] else "✗"
                 
                 self.char_tree.insert("", "end", values=(
@@ -2544,34 +2944,77 @@ class BattleGUI:
                 ))
 
     def _sort_characters(self, column):
-        """Sort characters by the selected column"""
-        items = [(self.char_tree.set(item, column), item) for item in self.char_tree.get_children("")]
-        
-        # Sort items
-        items.sort(reverse=self.char_tree.heading(column).get("reverse", False))
-        
-        # Rearrange items in sorted positions
-        for index, (_, item) in enumerate(items):
-            self.char_tree.move(item, "", index)
-        
-        # Reverse sort next time
-        self.char_tree.heading(column, 
-                              command=lambda: self._sort_characters(column),
-                              reverse=not self.char_tree.heading(column).get("reverse", False))
+        """Sort character list by column"""
+        try:
+            # Get current sort column and order
+            current_sort = getattr(self, '_char_sort_column', None)
+            current_order = getattr(self, '_char_sort_order', 'asc')
+            
+            # Update sort order
+            if current_sort == column:
+                new_order = 'desc' if current_order == 'asc' else 'asc'
+            else:
+                new_order = 'asc'
+            
+            # Store new sort settings
+            self._char_sort_column = column
+            self._char_sort_order = new_order
+            
+            # Update column header
+            for col in self.char_tree['columns']:
+                if col == column:
+                    self.char_tree.heading(col, text=f"{col} {'↓' if new_order == 'desc' else '↑'}")
+                else:
+                    self.char_tree.heading(col, text=col)
+            
+            # Get all items
+            item_list = [(self.char_tree.set(item, column), item) for item in self.char_tree.get_children('')]
+            
+            # Sort items
+            item_list.sort(reverse=(new_order == 'desc'))
+            
+            # Rearrange items in sorted order
+            for index, (_, item) in enumerate(item_list):
+                self.char_tree.move(item, '', index)
+
+        except Exception as e:
+            print(f"Error sorting characters: {e}")
+            traceback.print_exc()
 
     def _toggle_character_status(self, event):
-        """Toggle the enabled status of a character"""
-        region = self.char_tree.identify("region", event.x, event.y)
-        if region == "cell":
-            item = self.char_tree.selection()[0]
-            char = self.char_tree.item(item)["values"][0]
+        """Toggle character enabled/disabled status"""
+        try:
+            # Get selected item
+            selection = self.char_tree.selection()
+            if not selection:
+                return
+                
+            item = selection[0]
+            values = list(self.char_tree.item(item)['values'])
             
-            if char in self.manager.settings["enabled_characters"]:
-                self.manager.settings["enabled_characters"].remove(char)
+            # Toggle status (last column)
+            values[-1] = '✓' if values[-1] != '✓' else ''
+            
+            # Update tree
+            self.char_tree.item(item, values=values)
+            
+            # Update settings
+            char_name = values[0]  # Character name is first column
+            enabled_chars = self.manager.settings.get("enabled_chars", set())
+            
+            if values[-1] == '✓':
+                enabled_chars.add(char_name)
             else:
-                self.manager.settings["enabled_characters"].add(char)
+                enabled_chars.discard(char_name)
+                
+            self.manager.settings["enabled_chars"] = enabled_chars
             
-            self._populate_character_list()
+            # Save settings
+            self.save_config()
+            
+        except Exception as e:
+            print(f"Error toggling character status: {e}")
+            traceback.print_exc()
 
     def _select_all_chars(self):
         """Enable all characters"""
@@ -2590,158 +3033,271 @@ class BattleGUI:
         self._populate_character_list()
 
     def _setup_stats_tab(self):
-        # Create statistics view with multiple sections
-        
-        # Top panel - Summary statistics
-        summary_frame = ttk.LabelFrame(self.stats_tab, text="Summary")
-        summary_frame.pack(fill="x", padx=5, pady=5)
+        """Create statistics view with multiple sections"""
+        # Create main frame for stats tab
+        stats_frame = ttk.Frame(self.tabs["Stats"])
+        stats_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Grid for summary stats
+        # Create summary section at the top
+        summary_frame = ttk.LabelFrame(stats_frame, text="Summary Statistics")
+        summary_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Initialize summary labels dictionary
         self.summary_labels = {}
-        summary_stats = [
-            ("Total Battles", "total_battles"),
-            ("Most Winning Character", "top_winner"),
-            ("Most Used Stage", "top_stage"),
-            ("Average Battle Duration", "avg_duration")
-        ]
-        
-        for i, (label, key) in enumerate(summary_stats):
-            ttk.Label(summary_frame, text=f"{label}:").grid(row=i//2, column=i%2*2, padx=5, pady=5, sticky="e")
-            self.summary_labels[key] = ttk.Label(summary_frame, text="---")
-            self.summary_labels[key].grid(row=i//2, column=i%2*2+1, padx=5, pady=5, sticky="w")
 
-        # Character Statistics
-        char_stats_frame = ttk.LabelFrame(self.stats_tab, text="Character Statistics")
-        char_stats_frame.pack(expand=True, fill="both", padx=5, pady=5)
+        # Create summary statistics grid
+        summary_grid = ttk.Frame(summary_frame)
+        summary_grid.pack(fill=tk.X, padx=5, pady=5)
 
-        # Create Treeview for detailed stats
-        columns = ("Character", "Wins", "Losses", "Win Rate", "Tier", "Most Defeated", "Most Lost To")
-        self.stats_tree = ttk.Treeview(char_stats_frame, columns=columns, show="headings")
+        # Total Battles
+        ttk.Label(summary_grid, text="Total Battles:").grid(row=0, column=0, padx=5, pady=2, sticky="e")
+        self.summary_labels["total_battles"] = ttk.Label(summary_grid, text="0")
+        self.summary_labels["total_battles"].grid(row=0, column=1, padx=5, pady=2, sticky="w")
+
+        # Top Winner
+        ttk.Label(summary_grid, text="Top Winner:").grid(row=0, column=2, padx=5, pady=2, sticky="e")
+        self.summary_labels["top_winner"] = ttk.Label(summary_grid, text="N/A")
+        self.summary_labels["top_winner"].grid(row=0, column=3, padx=5, pady=2, sticky="w")
+
+        # Most Used Stage
+        ttk.Label(summary_grid, text="Most Used Stage:").grid(row=1, column=0, padx=5, pady=2, sticky="e")
+        self.summary_labels["top_stage"] = ttk.Label(summary_grid, text="N/A")
+        self.summary_labels["top_stage"].grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+        # Average Battle Duration
+        ttk.Label(summary_grid, text="Avg. Duration:").grid(row=1, column=2, padx=5, pady=2, sticky="e")
+        self.summary_labels["avg_duration"] = ttk.Label(summary_grid, text="N/A")
+        self.summary_labels["avg_duration"].grid(row=1, column=3, padx=5, pady=2, sticky="w")
+
+        # Configure grid columns to expand evenly
+        for i in range(4):
+            summary_grid.columnconfigure(i, weight=1)
+
+        # Create notebook for different stat views
+        stat_notebook = ttk.Notebook(stats_frame)
+        stat_notebook.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Overall Stats Tab
+        overall_frame = ttk.Frame(stat_notebook)
+        stat_notebook.add(overall_frame, text="Overall Stats")
+
+        # Create Treeview for overall stats
+        columns = ("Character", "Wins", "Losses", "Win Rate", "Tier")
+        self.stats_tree = ttk.Treeview(overall_frame, columns=columns, show="headings")
         
-        # Set column headings and widths
+        # Configure columns
         for col in columns:
-            self.stats_tree.heading(col, text=col, 
-                                  command=lambda c=col: self._sort_stats(c))
-            width = 100 if col not in ["Character", "Most Defeated", "Most Lost To"] else 150
+            self.stats_tree.heading(col, text=col, command=lambda c=col: self._sort_stats(c))
+            width = 150 if col == "Character" else 100
             self.stats_tree.column(col, width=width)
 
         # Add scrollbar
-        stats_scroll = ttk.Scrollbar(char_stats_frame, orient="vertical", 
-                                   command=self.stats_tree.yview)
+        stats_scroll = ttk.Scrollbar(overall_frame, orient=tk.VERTICAL, command=self.stats_tree.yview)
         self.stats_tree.configure(yscrollcommand=stats_scroll.set)
 
-        # Pack everything
-        self.stats_tree.pack(side="left", expand=True, fill="both")
-        stats_scroll.pack(side="right", fill="y")
+        # Pack treeview and scrollbar
+        self.stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        stats_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Battle History Visualization
-        graph_frame = ttk.LabelFrame(self.stats_tab, text="Battle History")
-        graph_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        # Matchup Stats Tab
+        matchup_frame = ttk.Frame(stat_notebook)
+        stat_notebook.add(matchup_frame, text="Matchup Stats")
 
-        # Create matplotlib figure
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        # Character selection for matchup view
+        char_select_frame = ttk.Frame(matchup_frame)
+        char_select_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(char_select_frame, text="Select Character:").pack(side=tk.LEFT)
+        self.matchup_char_var = tk.StringVar()
+        self.matchup_char_combo = ttk.Combobox(char_select_frame, textvariable=self.matchup_char_var)
+        self.matchup_char_combo['values'] = sorted(self.manager.characters)
+        self.matchup_char_combo.pack(side=tk.LEFT, padx=5)
+        self.matchup_char_combo.bind('<<ComboboxSelected>>', self._update_matchup_view)
 
-        # Add control buttons
-        controls_frame = ttk.Frame(graph_frame)
-        controls_frame.pack(fill="x", padx=5, pady=5)
+        # Create Treeview for matchup stats
+        columns = ("Opponent", "Wins", "Losses", "Win Rate", "Total Matches")
+        self.matchup_tree = ttk.Treeview(matchup_frame, columns=columns, show="headings")
+        
+        # Configure columns
+        for col in columns:
+            self.matchup_tree.heading(col, text=col)
+            width = 150 if col == "Opponent" else 100
+            self.matchup_tree.column(col, width=width)
 
-        # Time range selection
-        ttk.Label(controls_frame, text="Time Range:").pack(side="left")
-        self.time_range = ttk.Combobox(controls_frame, 
-                                     values=["Last 24 Hours", "Last Week", "Last Month", "All Time"],
-                                     state="readonly")
-        self.time_range.set("Last Week")
-        self.time_range.pack(side="left", padx=5)
-        self.time_range.bind("<<ComboboxSelected>>", self._update_battle_history)
+        # Add scrollbar
+        matchup_scroll = ttk.Scrollbar(matchup_frame, orient=tk.VERTICAL, command=self.matchup_tree.yview)
+        self.matchup_tree.configure(yscrollcommand=matchup_scroll.set)
 
-        # Refresh button
-        ttk.Button(controls_frame, text="Refresh", 
-                  command=self._update_battle_history).pack(side="right", padx=5)
+        # Pack treeview and scrollbar
+        self.matchup_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        matchup_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Initial update
-        self._update_battle_history()
+        # Most Common Matchups Tab
+        common_frame = ttk.Frame(stat_notebook)
+        stat_notebook.add(common_frame, text="Common Matchups")
 
-    def _update_battle_history(self, event=None):
-        """Update battle history visualization"""
-        # Clear previous plots
-        self.ax1.clear()
-        self.ax2.clear()
+        # Create Treeview for most common matchups
+        columns = ("Character", "Most Defeated", "Most Lost To")
+        self.common_tree = ttk.Treeview(common_frame, columns=columns, show="headings")
+        
+        # Configure columns
+        for col in columns:
+            self.common_tree.heading(col, text=col)
+            self.common_tree.column(col, width=150)
 
-        battles = self.manager.battle_history["battles"]
-        if not battles:
-            self.ax1.text(0.5, 0.5, "No battle history available", 
-                         ha='center', va='center')
-            self.canvas.draw()
+        # Add scrollbar
+        common_scroll = ttk.Scrollbar(common_frame, orient=tk.VERTICAL, command=self.common_tree.yview)
+        self.common_tree.configure(yscrollcommand=common_scroll.set)
+
+        # Pack treeview and scrollbar
+        self.common_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        common_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Stage Stats Tab
+        stage_frame = ttk.Frame(stat_notebook)
+        stat_notebook.add(stage_frame, text="Stage Stats")
+
+        # Create Treeview for stage stats
+        columns = ("Stage", "Times Used", "Last Used")
+        self.stage_tree = ttk.Treeview(stage_frame, columns=columns, show="headings")
+        
+        # Configure columns
+        for col in columns:
+            self.stage_tree.heading(col, text=col)
+            width = 200 if col == "Stage" else 100
+            self.stage_tree.column(col, width=width)
+
+        # Add scrollbar
+        stage_scroll = ttk.Scrollbar(stage_frame, orient=tk.VERTICAL, command=self.stage_tree.yview)
+        self.stage_tree.configure(yscrollcommand=stage_scroll.set)
+
+        # Pack treeview and scrollbar
+        self.stage_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        stage_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Add refresh button at the bottom
+        refresh_btn = ttk.Button(stats_frame, text="Refresh Stats", command=self._update_stats_view)
+        refresh_btn.pack(pady=5)
+
+        # Initial update of all views
+        self._update_stats_view()
+
+    def _update_matchup_view(self, event=None):
+        """Update the matchup statistics view"""
+        selected_char = self.matchup_char_var.get()
+        if not selected_char:
             return
 
-        # Convert timestamps to datetime objects
-        timestamps = [datetime.strptime(b["timestamp"], "%Y-%m-%d %H:%M:%S") 
-                     for b in battles]
+        # Clear existing items
+        for item in self.matchup_tree.get_children():
+            self.matchup_tree.delete(item)
 
-        # Filter based on selected time range
-        now = datetime.now()
-        if self.time_range.get() == "Last 24 Hours":
-            start_time = now - timedelta(days=1)
-        elif self.time_range.get() == "Last Week":
-            start_time = now - timedelta(weeks=1)
-        elif self.time_range.get() == "Last Month":
-            start_time = now - timedelta(days=30)
-        else:  # All Time
-            start_time = min(timestamps)
+        # Get matchup data
+        matchups = self.manager.get_character_matchups(selected_char)
+        
+        # Insert matchup data
+        for opponent, data in matchups.items():
+            self.matchup_tree.insert("", tk.END, values=(
+                opponent,
+                data["wins"],
+                data["losses"],
+                data["win_rate"],
+                data["total_matches"]
+            ))
 
-        # Filter battles within time range
-        filtered_battles = [(t, b) for t, b in zip(timestamps, battles) 
-                          if t >= start_time]
-        if not filtered_battles:
-            self.ax1.text(0.5, 0.5, "No battles in selected time range", 
-                         ha='center', va='center')
-            self.canvas.draw()
-            return
-
-        timestamps, battles = zip(*filtered_battles)
-
-        # Plot 1: Battle Activity Over Time
-        dates = matplotlib.dates.date2num(timestamps)
-        self.ax1.hist(dates, bins=min(len(dates), 50), 
-                     color='skyblue', edgecolor='black')
-        self.ax1.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m-%d'))
-        self.ax1.set_title("Battle Activity Over Time")
-        self.ax1.set_xlabel("Date")
-        self.ax1.set_ylabel("Number of Battles")
-        plt.setp(self.ax1.xaxis.get_majorticklabels(), rotation=45)
-
-        # Plot 2: Win Distribution (Top 10 Characters)
-        char_wins = {}
-        for battle in battles:
-            winner = battle["winner"]
-            if isinstance(winner, list):  # Team battle
-                for char in winner:
-                    char_wins[char] = char_wins.get(char, 0) + 1
-            else:  # Single battle
-                char_wins[winner] = char_wins.get(winner, 0) + 1
-
-        # Get top 10 winners
-        top_chars = sorted(char_wins.items(), key=lambda x: x[1], reverse=True)[:10]
-        if top_chars:
-            chars, wins = zip(*top_chars)
-            y_pos = np.arange(len(chars))
+    def _update_stats_view(self):
+        """Update all statistics views"""
+        # Update overall stats tree
+        for item in self.stats_tree.get_children():
+            self.stats_tree.delete(item)
+        
+        # Calculate total battles
+        total_battles = sum(
+            stats.get("wins", 0) + stats.get("losses", 0)
+            for stats in self.manager.character_stats.values()
+            if isinstance(stats, dict)
+        ) // 2
+        self.summary_labels["total_battles"].config(text=str(total_battles))
+        
+        # Find top winner
+        top_winner = "N/A"
+        max_wins = 0
+        for char, stats in self.manager.character_stats.items():
+            if isinstance(stats, dict):
+                wins = stats.get("wins", 0)
+                if wins > max_wins:
+                    max_wins = wins
+                    top_winner = char
+        self.summary_labels["top_winner"].config(text=top_winner)
+        
+        # Find most used stage
+        if self.manager.stage_stats:
+            try:
+                top_stage = max(
+                    self.manager.stage_stats.items(),
+                    key=lambda x: x[1].get("times_used", 0)
+                )[0]
+                self.summary_labels["top_stage"].config(text=top_stage)
+            except Exception as e:
+                print(f"Error finding top stage: {e}")
+                self.summary_labels["top_stage"].config(text="N/A")
+        
+        # Update overall stats
+        for char in sorted(self.manager.characters):
+            stats = self.manager.character_stats.get(char, {})
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            total_matches = wins + losses
+            win_rate = f"{(wins/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
+            tier = self.manager.get_character_tier(char)
             
-            self.ax2.barh(y_pos, wins, color='lightgreen')
-            self.ax2.set_yticks(y_pos)
-            self.ax2.set_yticklabels(chars)
-            self.ax2.invert_yaxis()
-            self.ax2.set_title("Top 10 Winning Characters")
-            self.ax2.set_xlabel("Number of Wins")
-
-        # Adjust layout and draw
-        self.fig.tight_layout()
-        self.canvas.draw()
+            self.stats_tree.insert("", "end", values=(
+                char,
+                wins,
+                losses,
+                win_rate,
+                tier
+            ))
+        
+        # Update common matchups tree
+        for item in self.common_tree.get_children():
+            self.common_tree.delete(item)
+            
+        for char in sorted(self.manager.characters):
+            most_defeated = self.manager.get_most_defeated_opponent(char)
+            most_lost_to = self.manager.get_most_lost_to_opponent(char)
+            
+            self.common_tree.insert("", "end", values=(
+                char,
+                most_defeated,
+                most_lost_to
+            ))
+        
+        # Update stage stats tree in Stats tab
+        for item in self.stage_tree.get_children():
+            self.stage_tree.delete(item)
+            
+        for stage in sorted(self.manager.stages):
+            stats = self.manager.stage_stats.get(stage, {})
+            times_used = stats.get("times_used", 0)
+            last_used = stats.get("last_used", "Never")
+            
+            self.stage_tree.insert("", "end", values=(
+                stage,
+                times_used,
+                last_used
+            ))
+            
+        # Update average duration
+        avg_duration = self.manager.get_average_battle_duration()
+        self.summary_labels["avg_duration"].config(text=avg_duration)
+        
+        # Update Stages tab list
+        self._populate_stage_list()
 
     def _setup_settings_tab(self):
         # General Settings
-        general_frame = ttk.LabelFrame(self.settings_tab, text="General Settings")
+        general_frame = ttk.LabelFrame(self.tabs["Settings"], text="General Settings")
         general_frame.pack(fill="x", padx=5, pady=5)
 
         # Auto-save settings
@@ -2760,7 +3316,7 @@ class BattleGUI:
         self.backup_freq.pack(side="left", padx=5)
 
         # Display Settings
-        display_frame = ttk.LabelFrame(self.settings_tab, text="Display Settings")
+        display_frame = ttk.LabelFrame(self.tabs["Settings"], text="Display Settings")
         display_frame.pack(fill="x", padx=5, pady=5)
 
         # Theme selection
@@ -2784,7 +3340,7 @@ class BattleGUI:
         self.font_size.pack(side="left", padx=5)
 
         # Advanced Settings
-        advanced_frame = ttk.LabelFrame(self.settings_tab, text="Advanced Settings")
+        advanced_frame = ttk.LabelFrame(self.tabs["Settings"], text="Advanced Settings")
         advanced_frame.pack(fill="x", padx=5, pady=5)
 
         # MUGEN executable path
@@ -2799,7 +3355,7 @@ class BattleGUI:
                   command=self._browse_mugen_path).pack(side="left")
 
         # Twitch Integration Settings
-        twitch_frame = ttk.LabelFrame(self.settings_tab, text="Twitch Integration")
+        twitch_frame = ttk.LabelFrame(self.tabs["Settings"], text="Twitch Integration")
         twitch_frame.pack(fill="x", padx=5, pady=5)
 
         # Bot Display Name
@@ -2862,13 +3418,17 @@ class BattleGUI:
         self.twitch_status_label.pack(pady=5)
 
     def _browse_mugen_path(self):
-        path = filedialog.askopenfilename(
-            title="Select MUGEN Executable",
-            filetypes=[("Executable files", "*.exe"), ("All files", "*.*")]
-        )
-        if path:
-            self.mugen_path_var.set(path)
-            self.manager.mugen_path = Path(path)
+        """Browse for MUGEN executable"""
+        try:
+            path = filedialog.askopenfilename(
+                filetypes=[("MUGEN executable", "mugen*.exe"), ("All files", "*.*")],
+                title="Select MUGEN Executable"
+            )
+            if path:
+                self.manager.mugen_path = Path(path)
+                self.mugen_path_var.set(path)
+        except Exception as e:
+            messagebox.showerror("Error", "Failed to set MUGEN path: %s" % str(e))
 
     def save_config(self):
         """Save configuration including tab order"""
@@ -2898,352 +3458,384 @@ class BattleGUI:
 
     def load_config(self):
         """Load configuration from file"""
-        path = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Load Configuration"
-        )
-        if path:
-            try:
-                with open(path) as f:
-                    config = json.load(f)
-                
-                # Load battle settings
-                battle_settings = config.get("battle_settings", {})
-                self.rounds_var.set(battle_settings.get("rounds", 1))
-                self.mode_var.set(battle_settings.get("battle_mode", "single"))
-                self.team_size_var.set(battle_settings.get("team_size", 3))
-                self.continuous_var.set(battle_settings.get("continuous_mode", True))
-                self.random_color_var.set(battle_settings.get("random_color", True))
-                self.team1_size_var.set(battle_settings.get("team1_size", 2))
-                self.team2_size_var.set(battle_settings.get("team2_size", 2))
-                self.random_team_sizes_var.set(battle_settings.get("random_team_sizes", True))
-                
-                # Load character and stage settings
-                self.manager.settings["enabled_characters"] = set(config.get("enabled_characters", []))
-                self.manager.settings["enabled_stages"] = set(config.get("enabled_stages", []))
-                
-                # Load display settings
-                self.apply_theme(config.get("theme", "light"))
-                self.font_size.set(config.get("font_size", 10))
-                
-                # Load general settings
-                self.autosave_var.set(config.get("autosave", True))
-                self.backup_freq.set(config.get("backup_frequency", "Weekly"))
-                
-                # Load Twitch settings
-                twitch_settings = config.get("twitch", {})
-                self.twitch_botname_var.set(twitch_settings.get("bot_name", "MugenBattleBot"))
-                self.twitch_channel_var.set(twitch_settings.get("channel", ""))
-                self.points_reward_var.set(twitch_settings.get("points_reward", 100))
-                self.betting_duration_var.set(twitch_settings.get("betting_duration", 20))
-                
-                # Load paths
-                mugen_path = config.get("mugen_path")
-                if mugen_path:
-                    self.manager.mugen_path = Path(mugen_path)
-                    self.mugen_path_var.set(mugen_path)
-                
-                # Update all views
-                self._refresh_all_views()
-                self._on_mode_change()  # Update battle mode UI
-                
-                messagebox.showinfo("Success", "Configuration loaded successfully!")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to load configuration: {str(e)}")
-
-    def _refresh_all_views(self):
-        """Refresh all GUI elements after configuration changes"""
-        self._populate_character_list()
-        self._update_stats_view()
-        self._populate_stage_list()
-
-    def run(self):
-        """Start the GUI with memory monitoring"""
-        # Start memory monitoring
-        self._monitor_memory_usage()
-        # Run the main loop
-        self.root.mainloop()
+        try:
+            path = filedialog.askopenfilename(
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                title="Load Configuration"
+            )
+            if path:
+                try:
+                    with open(path) as f:
+                        config = json.load(f)
+                    
+                    # Load battle settings
+                    battle_settings = config.get("battle_settings", {})
+                    self.rounds_var.set(battle_settings.get("rounds", "1"))
+                    self.mode_var.set(battle_settings.get("battle_mode", "single"))
+                    self.team_size_var.set(battle_settings.get("team_size", 3))
+                    self.continuous_var.set(battle_settings.get("continuous_mode", True))
+                    self.random_color_var.set(battle_settings.get("random_color", True))
+                    self.team1_size_var.set(battle_settings.get("team1_size", 2))
+                    self.team2_size_var.set(battle_settings.get("team2_size", 2))
+                    self.random_team_sizes_var.set(battle_settings.get("random_team_sizes", True))
+                    
+                    # Load character and stage settings
+                    self.manager.settings["enabled_characters"] = set(config.get("enabled_characters", []))
+                    self.manager.settings["enabled_stages"] = set(config.get("enabled_stages", []))
+                    
+                    # Refresh UI
+                    self._populate_character_list()
+                    self._populate_stage_list()
+                    self._update_stats_view()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to load configuration: {str(e)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error selecting file: {str(e)}")
 
     def export_stats(self):
-        """Export statistics to a file"""
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            title="Export Statistics"
-        )
-        if path:
-            try:
-                with open(path, 'w') as f:
-                    # Write header
-                    f.write("Character,Wins,Losses,Win Rate,Tier,Most Defeated,Most Lost To\n")
+        """Export battle statistics to a CSV file"""
+        try:
+            # Get file path from user
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title="Export Statistics"
+            )
+            
+            if path:
+                with open(path, 'w', newline='') as f:
+                    import csv
+                    writer = csv.writer(f)
                     
                     # Write character stats
+                    writer.writerow(["Character Statistics"])
+                    writer.writerow(["Character", "Wins", "Losses", "Win Rate", "Tier"])
+                    
                     for char in sorted(self.manager.characters):
-                        stats = self.manager.character_stats.get(char, {"wins": 0, "losses": 0})
-                        total_matches = stats["wins"] + stats["losses"]
-                        win_rate = f"{(stats['wins']/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
+                        stats = self.manager.character_stats.get(char, {})
+                        wins = stats.get("wins", 0)
+                        losses = stats.get("losses", 0)
+                        total_matches = wins + losses
+                        win_rate = f"{(wins/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
                         tier = self.manager.get_character_tier(char)
                         
-                        # TODO: Implement most defeated/lost to tracking
-                        most_defeated = "N/A"
-                        most_lost_to = "N/A"
+                        writer.writerow([char, wins, losses, win_rate, tier])
+                    
+                    # Add a blank line between sections
+                    writer.writerow([])
+                    
+                    # Write stage stats
+                    writer.writerow(["Stage Statistics"])
+                    writer.writerow(["Stage", "Times Used", "Last Used", "Average Duration"])
+                    
+                    for stage in sorted(self.manager.stages):
+                        stats = self.manager.stage_stats.get(stage, {})
+                        times_used = stats.get("times_used", 0)
+                        last_used = stats.get("last_used", "Never")
+                        avg_duration = stats.get("total_duration", 0) / times_used if times_used > 0 else 0
                         
-                        f.write(f"{char},{stats['wins']},{stats['losses']},{win_rate},{tier},{most_defeated},{most_lost_to}\n")
-                        
-                messagebox.showinfo("Success", "Statistics exported successfully!")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to export statistics: {str(e)}")
+                        writer.writerow([stage, times_used, last_used, f"{avg_duration:.1f}s"])
+                    
+                    messagebox.showinfo("Success", "Statistics exported successfully!")
+                    
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export statistics: {str(e)}")
+            print(f"Error exporting stats: {e}")
+            traceback.print_exc()
 
-    def reset_stats(self):
-        """Reset all statistics"""
-        if messagebox.askyesno("Confirm Reset", "Are you sure you want to reset all statistics? This cannot be undone."):
-            self.manager.character_stats = {}
-            self.manager.stage_stats = {}
-            self.manager.save_stats()
-            self._refresh_all_views()
-            messagebox.showinfo("Success", "Statistics reset successfully!")
+    def load_theme(self):
+        """Load custom theme colors"""
+        self.theme = {
+            "light": {
+                "bg": "#ffffff",
+                "fg": "#000000",
+                "select_bg": "#0078d7",
+                "select_fg": "#ffffff",
+                "button_bg": "#e1e1e1",
+                "accent": "#0078d7"
+            },
+            "dark": {
+                "bg": "#1e1e1e",
+                "fg": "#ffffff",
+                "select_bg": "#0078d7",
+                "select_fg": "#ffffff",
+                "button_bg": "#333333",
+                "accent": "#0078d7"
+            }
+        }
+        return self.theme
 
-    def show_documentation(self):
-        """Show documentation"""
-        doc_text = """
-MUGEN Random AI Battles
-
-Controls:
-- Battle Tab: Configure and start AI battles
-- Characters Tab: Enable/disable and filter characters
-- Stages Tab: Enable/disable and manage stages
-- Statistics Tab: View battle statistics and rankings
-- Settings Tab: Configure application settings
-
-Features:
-- Single, Team, and Turns battle modes
-- Character tier rankings based on performance
-- Stage usage tracking
-- Battle result logging
-- Configuration saving/loading
-- Statistics export
-
-For more information, visit: [Documentation URL]
-"""
-        doc_window = tk.Toplevel(self.root)
-        doc_window.title("Documentation")
-        doc_window.geometry("600x400")
+    def apply_theme(self, theme_name):
+        """Apply the selected theme"""
+        if not hasattr(self, 'theme'):
+            self.load_theme()
+            
+        theme = self.theme[theme_name]
+        self.root.configure(bg=theme["bg"])
+        style = ttk.Style()
         
-        text_widget = ScrolledText(doc_window, wrap=tk.WORD)
-        text_widget.pack(expand=True, fill="both", padx=10, pady=10)
-        text_widget.insert("1.0", doc_text)
-        text_widget.config(state="disabled")
+        # Configure ttk styles
+        style.configure(".", 
+                       background=theme["bg"],
+                       foreground=theme["fg"],
+                       fieldbackground=theme["bg"])
+        
+        style.configure("Accent.TButton",
+                       background=theme["accent"],
+                       foreground=theme["fg"])
+        
+        # Configure preview styles
+        style.configure("Preview.TFrame", background="black")
+        style.configure("Name.TLabel", 
+                       font=("Arial Black", 16, "bold"), 
+                       background="black", 
+                       foreground="white")
+        style.configure("Stats.TLabel", 
+                       font=("Arial", 12), 
+                       background="black", 
+                       foreground="white")
+        style.configure("Dark.TFrame", background="black")
+        
+        self.current_theme = theme_name
 
-    def show_about(self):
-        """Show about dialog"""
+    def create_menu(self):
+        """Create the application menu bar"""
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        # File Menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Load Config", command=self.load_config)
+        file_menu.add_command(label="Save Config", command=self.save_config)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export Stats", command=self.export_stats)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        
+        # Battle Menu
+        battle_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Battle", menu=battle_menu)
+        battle_menu.add_command(label="Start Battle (F5)", command=self._start_battle)
+        battle_menu.add_command(label="Stop Battle (F6)", command=self.stop_battle)
+        battle_menu.add_command(label="Quick Rematch (F7)", command=self._quick_rematch)
+        battle_menu.add_separator()
+        battle_menu.add_command(label="Force Next Round (F8)", command=self._force_next_round)
+        battle_menu.add_command(label="Reset Scores (F9)", command=self._reset_battle_scores)
+        battle_menu.add_command(label="Change Stage (F10)", command=self._change_random_stage)
+        
+        # View Menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_command(label="Refresh Stats", command=self._update_stats_view)
+        view_menu.add_separator()
+        
+        # Theme submenu
+        theme_menu = tk.Menu(view_menu, tearoff=0)
+        view_menu.add_cascade(label="Theme", menu=theme_menu)
+        theme_menu.add_command(label="Light", command=lambda: self.apply_theme("light"))
+        theme_menu.add_command(label="Dark", command=lambda: self.apply_theme("dark"))
+        
+        # Help Menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Keyboard Shortcuts", command=self._show_shortcuts)
+        help_menu.add_command(label="About", command=self._show_about)
+
+    def _show_shortcuts(self):
+        """Display keyboard shortcuts help dialog"""
+        shortcuts = """
+        Keyboard Shortcuts:
+        F5 - Start Battle
+        F6 - Stop Battle
+        F7 - Quick Rematch
+        F8 - Force Next Round
+        F9 - Reset Scores
+        F10 - Change Stage
+        """
+        messagebox.showinfo("Keyboard Shortcuts", shortcuts)
+
+    def _show_about(self):
+        """Display about dialog"""
         about_text = """
-MUGEN Random AI Battles
-Version 1.0.0
-
-A modern GUI for managing MUGEN AI battles.
-Features character statistics, battle modes,
-and comprehensive battle management.
-
-Created by: [Your Name]
-Based on the original batch script by Inktrebuchet
-and Chickenbone's modifications.
-
-© 2024 All rights reserved.
-"""
+        MUGEN Battle Manager
+        
+        A comprehensive battle management system for MUGEN
+        featuring AI battles, statistics tracking, and
+        Twitch integration.
+        
+        Created with ♥ for the MUGEN community
+        """
         messagebox.showinfo("About", about_text)
 
-    def _update_stats_view(self):
-        """Update the statistics view"""
-        # Clear existing items
-        for item in self.stats_tree.get_children():
-            self.stats_tree.delete(item)
-        
-        # Update summary statistics
-        total_battles = 0
-        for stats in self.manager.character_stats.values():
-            if isinstance(stats, dict):
-                total_battles += stats.get("wins", 0) + stats.get("losses", 0)
-            elif isinstance(stats, list) and len(stats) >= 2:
-                total_battles += stats[0] + stats[1]  # Assuming [wins, losses]
-        self.summary_labels["total_battles"].config(text=str(total_battles))
-        
-        # Find top winner
-        if self.manager.character_stats:
-            try:
-                def get_wins(stats):
-                    if isinstance(stats, dict):
-                        return stats.get("wins", 0)
-                    elif isinstance(stats, list) and len(stats) >= 1:
-                        return stats[0]  # Assuming [wins, losses]
-                    return 0
+    def start_auto_save_timer(self):
+        """Start the auto-save timer if enabled"""
+        if hasattr(self, 'auto_save_timer') and self.auto_save_timer:
+            self.root.after_cancel(self.auto_save_timer)
+            
+        if hasattr(self, 'autosave_var') and self.autosave_var.get():
+            # Auto-save every 5 minutes (300000 ms)
+            self.auto_save_timer = self.root.after(300000, self._auto_save_callback)
 
-                top_winner = max(
-                    self.manager.character_stats.items(),
-                    key=lambda x: get_wins(x[1])
-                )[0]
-                self.summary_labels["top_winner"].config(text=top_winner)
-            except Exception as e:
-                print(f"Error finding top winner: {e}")
-                self.summary_labels["top_winner"].config(text="N/A")
-        
-        # Find most used stage
-        if self.manager.stage_stats:
-            try:
-                top_stage = max(
-                    self.manager.stage_stats.items(),
-                    key=lambda x: x[1].get("times_used", 0)
-                )[0]
-                self.summary_labels["top_stage"].config(text=top_stage)
-            except Exception as e:
-                print(f"Error finding top stage: {e}")
-                self.summary_labels["top_stage"].config(text="N/A")
-        
-        # Add character statistics
-        for char in sorted(self.manager.characters):
-            stats = self.manager.character_stats.get(char, {})
+    def _auto_save_callback(self):
+        """Callback for auto-saving data"""
+        try:
+            # Save stats
+            self.manager.save_stats()
             
-            # Handle both dict and list formats
-            if isinstance(stats, dict):
-                wins = stats.get("wins", 0)
-                losses = stats.get("losses", 0)
-            elif isinstance(stats, list) and len(stats) >= 2:
-                wins = stats[0]
-                losses = stats[1]
-            else:
-                wins = 0
-                losses = 0
+            # Save battle history
+            self.manager.save_battle_history()
             
-            total_matches = wins + losses
-            win_rate = f"{(wins/total_matches)*100:.1f}%" if total_matches > 0 else "N/A"
-            tier = self.manager.get_character_tier(char)
+            # Save config
+            self.save_config()
             
-            # TODO: Implement most defeated/lost to tracking
-            most_defeated = "N/A"
-            most_lost_to = "N/A"
+            print("Auto-saved data successfully")
             
-            self.stats_tree.insert("", "end", values=(
-                char,
-                wins,
-                losses,
-                win_rate,
-                tier,
-                most_defeated,
-                most_lost_to
-            ))
-        
-        # Update average duration
-        avg_duration = self.manager.get_average_battle_duration()
-        self.summary_labels["avg_duration"].config(text=avg_duration)
-        
-        # Update stage statistics
-        for item in self.stage_tree.get_children():
-            stage = self.stage_tree.item(item)["values"][0]
-            stats = self.manager.stage_stats.get(stage, {})
+            # Schedule next auto-save
+            self.start_auto_save_timer()
+        except Exception as e:
+            print(f"Error during auto-save: {e}")
+            traceback.print_exc()
             
-            self.stage_tree.set(item, "Times Used", stats.get("times_used", 0))
-            self.stage_tree.set(item, "Last Used", stats.get("last_used", "Never"))
+            # Try again in 1 minute if there was an error
+            self.auto_save_timer = self.root.after(60000, self._auto_save_callback)
 
-    def _sort_stats(self, column):
-        """Sort statistics by the selected column"""
-        # Store the current sort column and order
-        if not hasattr(self, '_sort_column'):
-            self._sort_column = None
-            self._sort_reverse = False
+    def _on_mode_change(self, *args):
+        """Handle battle mode changes"""
+        mode = self.mode_var.get()
         
-        # Toggle sort order if clicking the same column
-        if self._sort_column == column:
-            self._sort_reverse = not self._sort_reverse
+        # Update team size controls visibility based on mode
+        if mode == "simul":
+            self.team_size_var.set(2)  # Default for simul battles
+            self.random_team_sizes_var.set(True)
         else:
-            self._sort_column = column
-            self._sort_reverse = False
+            self.team_size_var.set(1)  # Single character for other modes
+            self.random_team_sizes_var.set(False)
+        
+        # Update manager settings
+        self._update_manager_settings()
 
-        # Get all items with their values
-        items = [(self.stats_tree.set(item, column), item) for item in self.stats_tree.get_children("")]
-        
-        # Convert values for proper sorting
-        def convert_value(value):
-            try:
-                # Handle percentage values
-                if isinstance(value, str) and value.endswith('%'):
-                    return float(value.rstrip('%'))
-                # Handle numeric values
-                return float(value) if value.replace('.', '').isdigit() else value
-            except:
-                return value
+    def load_config_data(self, config: Dict):
+        """Load configuration data from a dictionary"""
+        try:
+            # Load theme
+            if "theme" in config:
+                self.apply_theme(config["theme"])
+                self.theme_combo.set(config["theme"].capitalize())
+            
+            # Load battle settings
+            if "battle_settings" in config:
+                battle_settings = config["battle_settings"]
+                self.mode_var.set(battle_settings.get("mode", "single"))
+                self.rounds_var.set(battle_settings.get("rounds", "1"))
+                self.continuous_var.set(battle_settings.get("continuous", False))
+                self.random_color_var.set(battle_settings.get("random_color", True))
+                self.team_size_var.set(battle_settings.get("team_size", 2))
                 
-        # Sort items
-        items.sort(key=lambda x: convert_value(x[0]), reverse=self._sort_reverse)
-        
-        # Rearrange items in sorted positions
-        for index, (_, item) in enumerate(items):
-            self.stats_tree.move(item, "", index)
-        
-        # Update the heading text to show sort direction
-        for col in self.stats_tree["columns"]:
-            if col == column:
-                direction = " ▼" if self._sort_reverse else " ▲"
-                self.stats_tree.heading(col, text=col + direction)
-            else:
-                # Remove sort indicator from other columns
-                self.stats_tree.heading(col, text=col.rstrip(" ▼▲"))
+            # Load Twitch settings
+            if "twitch_settings" in config:
+                twitch_settings = config["twitch_settings"]
+                self.twitch_token_var.set(twitch_settings.get("token", ""))
+                self.twitch_channel_var.set(twitch_settings.get("channel", ""))
+                self.twitch_botname_var.set(twitch_settings.get("bot_name", "MugenBattleBot"))
+                self.betting_duration_var.set(twitch_settings.get("betting_duration", 20))
+                self.points_reward_var.set(twitch_settings.get("points_reward", 100))
+            
+            # Load auto-save settings
+            if "auto_save" in config:
+                self.autosave_var.set(config["auto_save"])
+            
+            # Load backup settings
+            if "backup_frequency" in config:
+                self.backup_freq.set(config["backup_frequency"])
+            
+            # Load font settings
+            if "font_size" in config:
+                self.font_size.set(config["font_size"])
+            
+            # Update UI based on loaded settings
+            self._on_mode_change()
+            self._update_manager_settings()
+            
+        except Exception as e:
+            print(f"Error loading config data: {e}")
+            traceback.print_exc()
+
+    def _stop_battle(self):
+        """Stop the current battle"""
+        try:
+            self.manager._cleanup_battle()
+            self.battle_monitor = None
+            self.tournament_monitor = None
+            
+            # Update UI elements
+            if hasattr(self, 'battle_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                log_text = f"[{timestamp}] Battle stopped\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+                
+        except Exception as e:
+            print(f"Error stopping battle: {e}")
+            traceback.print_exc()
 
     def _start_battle(self):
-        """Start a new battle"""
+        """Start a new battle with current settings"""
         try:
-            # Don't start a new battle if one is already in progress
+            # Check if battle is already running
             if self.battle_monitor:
-                print("Battle already in progress")
+                messagebox.showwarning("Warning", "A battle is already in progress!")
                 return
 
-            # Clear any existing battle state
-            self.stop_battle()
-            time.sleep(0.5)  # Give time for cleanup
-
-            # Prepare the battle info
-            try:
-                self.prepared_battle_info = self.manager.prepare_battle()
-                print("Prepared battle info:", self.prepared_battle_info)
-            except Exception as e:
-                print(f"Error preparing battle: {e}")
-                traceback.print_exc()
+            # Check if there are enough enabled characters
+            enabled_chars = [char for char in self.character_tree.get_children() 
+                           if self.character_tree.item(char)['values'][0] == '✓']
+            if len(enabled_chars) < 2:
+                messagebox.showerror("Error", "Not enough characters enabled! Enable at least 2 characters.")
                 return
 
-            # Show battle preview and start betting period
-            self.show_battle_preview(self.prepared_battle_info)
+            # Check if there are enabled stages
+            enabled_stages = [stage for stage in self.stage_tree.get_children() 
+                            if self.stage_tree.item(stage)['values'][0] == '✓']
+            if not enabled_stages:
+                messagebox.showerror("Error", "No stages enabled! Enable at least one stage.")
+                return
+
+            # Prepare battle information
+            self.prepared_battle_info = self.manager.prepare_battle()
             
-            # If Twitch bot is connected, create poll
-            if self.twitch_bot and self.twitch_bot.connected:
+            # Update preview tab with battle info
+            self._update_preview_tab(self.prepared_battle_info)
+
+            # If Twitch bot is connected and active, start betting period
+            if hasattr(self, 'twitch_bot') and self.twitch_bot and self.twitch_bot.connected:
+                # Format battle title based on mode
                 if self.prepared_battle_info['mode'] == "single":
                     title = f"{self.prepared_battle_info['p1']} vs {self.prepared_battle_info['p2']}"
-                    option1 = self.prepared_battle_info['p1']
-                    option2 = self.prepared_battle_info['p2']
+                    team1 = self.prepared_battle_info['p1']
+                    team2 = self.prepared_battle_info['p2']
                 else:
-                    title = "Team Battle"
-                    option1 = " & ".join(self.prepared_battle_info['p1'])
-                    option2 = " & ".join(self.prepared_battle_info['p2'])
+                    team1 = " & ".join(self.prepared_battle_info['p1'])
+                    team2 = " & ".join(self.prepared_battle_info['p2'])
+                    title = f"Team Battle: {team1} vs {team2}"
+
+                # Start betting period
+                betting_duration = self.betting_duration_var.get()
+                asyncio.run_coroutine_threadsafe(
+                    self.twitch_bot.create_battle_poll(title, team1, team2, betting_duration),
+                    self.twitch_bot.loop
+                )
                 
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self.twitch_bot.create_battle_poll(title, option1, option2, self.betting_duration),
-                        self.twitch_bot.loop
-                    )
-                    # Start the betting timer
-                    self._update_betting_timer(self.betting_duration)
-                except Exception as e:
-                    print(f"Error creating Twitch poll: {e}")
-                    traceback.print_exc()
-                    # Start battle without betting if poll creation fails
-                    self._start_actual_battle()
+                # Start betting timer
+                self._update_betting_timer(betting_duration)
             else:
-                # If no Twitch bot, start battle immediately
+                # Start battle immediately if no Twitch integration
                 self._start_actual_battle()
 
         except Exception as e:
-            print(f"Failed to start battle: {str(e)}")
+            messagebox.showerror("Error", f"Failed to start battle: {str(e)}")
+            print(f"Error starting battle: {e}")
             traceback.print_exc()
-            self.battle_monitor = None  # Reset battle monitor on error
-            # Try to clean up
-            self.stop_battle()
 
     def _start_actual_battle(self):
         """Start the actual battle with prepared info"""
@@ -3256,14 +3848,6 @@ and Chickenbone's modifications.
             if not hasattr(self, 'prepared_battle_info') or not self.prepared_battle_info:
                 print("No battle info available")
                 return
-
-            # Close preview window before starting battle
-            if hasattr(self, 'preview_window') and self.preview_window:
-                try:
-                    self.preview_window.destroy()
-                except:
-                    pass
-                self.preview_window = None
 
             # Store battle info and clear prepared info to prevent duplicate starts
             battle_info = self.prepared_battle_info
@@ -3279,6 +3863,195 @@ and Chickenbone's modifications.
             if self.battle_monitor:
                 self.root.after_cancel(self.battle_monitor)
                 self.battle_monitor = None
+
+    def run(self):
+        """Start the main application loop"""
+        try:
+            # Load initial configuration
+            self.load_config()
+            
+            # Load theme
+            self.load_theme()
+            
+            # Start auto-save timer
+            self.start_auto_save_timer()
+            
+            # Update initial stats view
+            self._update_stats_view()
+            
+            # Populate character and stage lists
+            self._populate_character_list()
+            self._populate_stage_list()
+            
+            # Update any dependent UI elements
+            self._update_manager_settings()
+            
+            # Start the main event loop
+            self.root.mainloop()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start application: {str(e)}")
+            print(f"Error starting application: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            # Cleanup on exit
+            try:
+                self.save_config()
+                self.manager.save_stats()
+                self.manager.save_battle_history()
+                if hasattr(self, 'twitch_bot') and self.twitch_bot:
+                    if hasattr(self.twitch_bot, 'loop') and self.twitch_bot.loop:
+                        self.twitch_bot.loop.stop()
+                    self.twitch_bot = None
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
+                traceback.print_exc()
+
+    def _setup_preview_tab(self):
+        """Setup the battle preview tab"""
+        preview_frame = self.tabs["Preview"]
+        preview_frame.configure(style="Preview.TFrame")
+        
+        # Create main preview container that will hold the battle preview
+        self.preview_display = ttk.Frame(preview_frame, style="Preview.TFrame")
+        self.preview_display.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        
+        # Create initial empty frames for teams
+        team1_frame = ttk.Frame(self.preview_display, style="Preview.TFrame")
+        team1_frame.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        
+        vs_frame = ttk.Frame(self.preview_display, style="Preview.TFrame")
+        vs_frame.pack(side=tk.LEFT, padx=20)
+        ttk.Label(vs_frame, text="VS", style="Name.TLabel").pack(pady=5)
+        
+        team2_frame = ttk.Frame(self.preview_display, style="Preview.TFrame")
+        team2_frame.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH)
+        
+        # Stage Preview (Bottom)
+        stage_frame = ttk.Frame(preview_frame, style="Preview.TFrame")
+        stage_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+        
+        ttk.Label(stage_frame, text="STAGE", style="Name.TLabel").pack(pady=5)
+        self.stage_preview = ttk.Label(stage_frame, image=self.placeholder_stage)
+        self.stage_preview.pack()
+        
+        # Add betting information display if enabled
+        if hasattr(self, 'betting_enabled') and self.betting_enabled:
+            betting_frame = ttk.Frame(preview_frame, style="Preview.TFrame")
+            betting_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+            
+            self.team1_bets = ttk.Label(betting_frame, text="Team 1: 0 points", style="Stats.TLabel")
+            self.team1_bets.pack(side=tk.LEFT, padx=10)
+            
+            self.team2_bets = ttk.Label(betting_frame, text="Team 2: 0 points", style="Stats.TLabel")
+            self.team2_bets.pack(side=tk.RIGHT, padx=10)
+            
+            self.betting_timer = ttk.Label(betting_frame, text="", style="Stats.TLabel")
+            self.betting_timer.pack()
+        
+        # Add timer display
+        timer_frame = ttk.Frame(preview_frame, style="Preview.TFrame")
+        timer_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.preview_timer = ttk.Label(timer_frame, text="", style="Name.TLabel", anchor="center")
+        self.preview_timer.pack(fill=tk.X)
+
+    def _create_fighter_display(self, parent, fighter, team_name, side):
+        """Create a single fighter display"""
+        frame = ttk.Frame(parent, style="Dark.TFrame")
+        frame.pack(expand=True, fill="both")
+
+        # Team name with colored background
+        team_bg = "#ff3366" if side == "left" else "#3366ff"
+        team_frame = tk.Frame(frame, bg=team_bg)
+        team_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(team_frame, text=team_name, style="Name.TLabel").pack(pady=5)
+
+        # Portrait with placeholder
+        portrait_path = self.manager.chars_path / fighter / "portrait.png"
+        try:
+            if portrait_path.exists():
+                img = Image.open(portrait_path)
+                img.thumbnail((300, 300))  # Larger portraits
+                photo = ImageTk.PhotoImage(img)
+            else:
+                photo = self.placeholder_portrait
+        except Exception as e:
+            print(f"Error loading portrait for {fighter}: {e}")
+            photo = self.placeholder_portrait
+
+        portrait_label = ttk.Label(frame, image=photo)
+        portrait_label.image = photo
+        portrait_label.pack(pady=10)
+
+        # Fighter name
+        ttk.Label(frame, text=fighter, style="Name.TLabel").pack()
+
+        # Stats
+        stats = self.manager.character_stats.get(fighter, {"wins": 0, "losses": 0})
+        total_matches = stats["wins"] + stats["losses"]
+        win_rate = f"{(stats['wins']/total_matches)*100:.1f}%" if total_matches > 0 else "No matches"
+        
+        stats_text = f"Wins: {stats['wins']} | Losses: {stats['losses']}\nWin Rate: {win_rate}"
+        ttk.Label(frame, text=stats_text, style="Stats.TLabel").pack(pady=5)
+
+    def _create_team_display(self, parent, team, team_name, side):
+        """Create a team display"""
+        frame = ttk.Frame(parent, style="Dark.TFrame")
+        frame.pack(expand=True, fill="both")
+
+        # Team name with colored background
+        team_bg = "#ff3366" if side == "left" else "#3366ff"
+        team_frame = tk.Frame(frame, bg=team_bg)
+        team_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(team_frame, text=team_name, style="Name.TLabel").pack(pady=5)
+
+        # Calculate team stats
+        total_wins = sum(self.manager.character_stats.get(fighter, {"wins": 0})["wins"] for fighter in team)
+        total_matches = sum(
+            self.manager.character_stats.get(fighter, {"wins": 0, "losses": 0})["wins"] + 
+            self.manager.character_stats.get(fighter, {"wins": 0, "losses": 0})["losses"] 
+            for fighter in team
+        )
+        win_rate = f"{(total_wins/total_matches)*100:.1f}%" if total_matches > 0 else "No matches"
+        ttk.Label(frame, text=f"Team Win Rate: {win_rate}", style="Stats.TLabel").pack()
+
+        # Create a grid of fighter portraits
+        grid_frame = ttk.Frame(frame, style="Dark.TFrame")
+        grid_frame.pack(pady=10)
+        
+        row = 0
+        col = 0
+        for fighter in team:
+            fighter_frame = ttk.Frame(grid_frame, style="Dark.TFrame")
+            fighter_frame.grid(row=row, column=col, padx=5, pady=5)
+            
+            # Portrait
+            portrait_path = self.manager.chars_path / fighter / "portrait.png"
+            try:
+                if portrait_path.exists():
+                    img = Image.open(portrait_path)
+                    img.thumbnail((150, 150))  # Smaller for team display
+                    photo = ImageTk.PhotoImage(img)
+                else:
+                    photo = self.placeholder_portrait
+            except Exception as e:
+                print(f"Error loading portrait for {fighter}: {e}")
+                photo = self.placeholder_portrait
+
+            portrait_label = ttk.Label(fighter_frame, image=photo)
+            portrait_label.image = photo
+            portrait_label.pack()
+
+            # Fighter name
+            ttk.Label(fighter_frame, text=fighter, style="Stats.TLabel").pack()
+            
+            # Update grid position
+            col += 1
+            if col > 1:  # 2 columns
+                col = 0
+                row += 1
 
     def _update_betting_timer(self, remaining):
         """Update betting timer and start battle when done"""
@@ -3312,679 +4085,142 @@ and Chickenbone's modifications.
             print(f"Timer update error: {e}")
             traceback.print_exc()
 
-    def stop_battle(self):
-        """Stop the current battle and clean up"""
-        try:
-            # Stop battle monitoring
-            if self.battle_monitor:
-                self.root.after_cancel(self.battle_monitor)
-                self.battle_monitor = None
-
-            # Close preview window if open
-            if hasattr(self, 'preview_window') and self.preview_window:
-                try:
-                    self.preview_window.destroy()
-                except:
-                    pass
-                self.preview_window = None
-
-            # End Twitch poll if active
-            if self.twitch_bot and self.twitch_bot.betting_active:
-                asyncio.run_coroutine_threadsafe(
-                    self.twitch_bot.end_poll(),
-                    self.twitch_bot.loop
-                )
-
-            # Find and terminate MUGEN process
-            try:
-                subprocess.run('taskkill /F /IM mugen.exe', shell=True, stderr=subprocess.DEVNULL)
-                time.sleep(0.5)  # Give process time to terminate
-            except:
-                pass
-
-            # Clean up MugenWatcher
-            if self.manager.watcher_process:
-                try:
-                    self.manager.watcher_process.terminate()
-                    time.sleep(0.5)  # Give process time to terminate
-                    self.manager.watcher_process = None
-                except:
-                    pass
-
-            # Clear all battle states
-            self.manager.current_battle = None
-            self.prepared_battle_info = None
-            self.manager.battle_start_time = None
-            
-            # Reset Twitch betting state
-            if self.twitch_bot:
-                self.twitch_bot.betting_active = False
-                self.twitch_bot.current_bets = {"1": {}, "2": {}}
-
-            # Log battle stop
-            timestamp = time.strftime("%H:%M:%S")
-            if hasattr(self, 'battle_log'):
-                self.battle_log.insert(tk.END, f"[{timestamp}] Battle stopped\n")
-                self.battle_log.see(tk.END)
-
-        except Exception as e:
-            print(f"Failed to stop battle: {str(e)}")
-            traceback.print_exc()  # Add stack trace for debugging
-            # Try emergency cleanup
-            self.manager.current_battle = None
-            self.prepared_battle_info = None
-            self.battle_monitor = None
-
-    def update_twitch_status(self, connected: bool):
-        """Update Twitch connection status in GUI"""
-        timestamp = time.strftime("%H:%M:%S")
-        if connected:
-            bot_name = self.twitch_bot.nick if self.twitch_bot else "Unknown"
-            status_text = f"[{timestamp}] Connected to Twitch as {bot_name}\n"
-            # Update status label in settings tab if it exists
-            if hasattr(self, 'twitch_status_label'):
-                self.twitch_status_label.config(
-                    text=f"Status: Connected as {bot_name}",
-                    foreground="green"
-                )
-        else:
-            status_text = f"[{timestamp}] Disconnected from Twitch\n"
-            if hasattr(self, 'twitch_status_label'):
-                self.twitch_status_label.config(
-                    text="Status: Disconnected",
-                    foreground="red"
-                )
-        
-        # Log to battle log
-        if hasattr(self, 'battle_log'):
-            self.battle_log.insert(tk.END, status_text)
-            self.battle_log.see(tk.END)
-
-    def auto_save_config(self):
-        """Auto-save configuration to default file"""
-        if not self.autosave_var.get():
-            return
-        
-        config = {
-            "battle_settings": {
-                "rounds": self.rounds_var.get(),
-                "time": self.time_var.get(),  # Add time setting
-                "battle_mode": self.mode_var.get(),
-                "team_size": self.team_size_var.get(),
-                "continuous_mode": self.continuous_var.get(),
-                "enabled_characters": set(self.characters),  # Initially enable all characters
-                "enabled_stages": set(self.stages)  # Initially enable all stages
-            },
-            "enabled_characters": list(self.manager.settings["enabled_characters"]),
-            "enabled_stages": list(self.manager.settings["enabled_stages"]),
-            "theme": self.current_theme,
-            "font_size": self.font_size.get(),
-            "autosave": self.autosave_var.get(),
-            "backup_frequency": self.backup_freq.get(),
-            "twitch": {
-                "bot_name": self.twitch_botname_var.get(),
-                "channel": self.twitch_channel_var.get(),
-                "points_reward": self.points_reward_var.get(),
-                "betting_duration": self.betting_duration_var.get()
-            },
-            "mugen_path": str(self.manager.mugen_path)
-        }
-        
-        try:
-            with open(config_path, 'w') as f:
-                json.dump(config, f, indent=2)
-        except Exception as e:
-            print(f"Auto-save failed: {e}")
-
-    def _quick_rematch(self):
-        """Quickly restart the last battle with same fighters"""
-        if hasattr(self.manager, 'current_battle') and self.manager.current_battle:
-            self._stop_battle()
-            time.sleep(0.5)  # Brief pause
-            self.manager.start_battle()
-            self.battle_monitor = self.root.after(1000, self._check_battle_result)
-
-    def _force_next_round(self):
-        """Force the current battle to proceed to next round"""
-        try:
-            subprocess.run('taskkill /F /IM mugen.exe', shell=True)
-            time.sleep(0.5)
-            self.manager.start_battle()
-            self.battle_monitor = self.root.after(1000, self._check_battle_result)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to force next round: {str(e)}")
-
-    def _reset_battle_scores(self):
-        """Reset the current battle scores"""
-        if hasattr(self.manager, 'current_battle') and self.manager.current_battle:
-            self._stop_battle()
-            time.sleep(0.5)
-            self.manager.start_battle()
-            self.battle_monitor = self.root.after(1000, self._check_battle_result)
-
-    def _change_random_stage(self):
-        """Change to a random stage while keeping same fighters"""
-        if hasattr(self.manager, 'current_battle') and self.manager.current_battle:
-            current_battle = self.manager.current_battle.copy()
-            current_battle['stage'] = random.choice(list(self.manager.settings['enabled_stages']))
-            self._stop_battle()
-            time.sleep(0.5)
-            self.manager.start_battle()
-            self.battle_monitor = self.root.after(1000, self._check_battle_result)
-
-    def _toggle_ai_level(self):
-        """Toggle AI difficulty level"""
-        try:
-            # You might need to modify this based on how MUGEN handles AI levels
-            current_level = self.manager.settings.get('ai_level', 4)
-            new_level = 8 if current_level == 4 else 4  # Toggle between 4 and 8
-            self.manager.settings['ai_level'] = new_level
-            messagebox.showinfo("AI Level", f"AI Level set to {new_level}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to toggle AI level: {str(e)}")
-
-    def _start_battle_after_betting(self):
-        """Force start the battle immediately after betting"""
-        if hasattr(self, 'preview_window') and self.preview_window.winfo_exists():
-            self.preview_window.destroy()
-        if self.twitch_bot:
-            asyncio.run_coroutine_threadsafe(
-                self.twitch_bot.end_poll(),
-                self.twitch_bot.loop
-            )
-        self.manager.start_battle(self.manager.current_battle)
-        self.battle_monitor = self.root.after(1000, self._check_battle_result)
-
-    def _connect_twitch(self):
-        """Connect to Twitch"""
-        token = self.twitch_token_var.get()
-        channel = self.twitch_channel_var.get()
-        bot_name = self.twitch_botname_var.get()
-        
-        if not token or not channel:
-            messagebox.showerror("Error", "Please enter both OAuth token and channel name")
-            return
-        
-        try:
-            # First disconnect existing bot if any
-            if self.twitch_bot:
-                self.update_twitch_status(False)
-                self.twitch_bot = None
-            
-            self.betting_duration = self.betting_duration_var.get()
-            self.setup_twitch_bot(token, channel, bot_name)
-            # Don't show success message here - wait for event_ready
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to connect to Twitch: {str(e)}")
-            self.update_twitch_status(False)
-
-    def setup_twitch_bot(self, token, channel, bot_name):
-        """Initialize Twitch bot with credentials and custom name"""
-        try:
-            # Format token if needed
-            if not token.startswith('oauth:'):
-                token = 'oauth:' + token
-                
-            # Create the bot instance
-            self.twitch_bot = TwitchBot(token, channel, self, bot_name)
-            
-            # Start the bot in a separate thread
-            threading.Thread(target=self._run_twitch_bot, daemon=True).start()
-            
-        except Exception as e:
-            print(f"Error setting up Twitch bot: {e}")
-            traceback.print_exc()
-            self.update_twitch_status(False)
-
-    def _run_twitch_bot(self):
-        """Run Twitch bot in a separate thread"""
-        try:
-            self.twitch_bot.run()
-        except Exception as e:
-            print(f"Error running Twitch bot: {e}")
-            traceback.print_exc()
-            self.root.after(0, self.update_twitch_status, False)
-
-    def _check_battle_result(self):
-        """Check battle result and handle updates with automatic recovery"""
-        try:
-            # Check if MUGEN is still running
-            mugen_running = self.manager._check_mugen_running()
-            if not mugen_running:
-                print("MUGEN process ended, checking for final result")
-                
-                # Give the watcher a moment to write the final result
-                time.sleep(0.5)
-                
-                # Try to get the final result
-                result = self.manager.check_battle_result()
-                if result:
-                    print(f"Final battle result received: {result}")
-                    self._handle_battle_result(result)
-                else:
-                    print("No final result available")
-                    # Try to recover from failed battle
-                    self._handle_failed_battle()
-                    # If continuous mode is on, prepare next battle
-                    if self.continuous_var.get():
-                        self.root.after(2000, self._prepare_next_battle)
-                
-                self.battle_monitor = None
-                return
-            
-            # Check for result while battle is running
-            result = self.manager.check_battle_result()
-            if result:
-                print(f"Battle result received during battle: {result}")
-                self._handle_battle_result(result)
-                self.battle_monitor = None
-                return
-            
-            # Continue monitoring if no result yet
-            if self.battle_monitor is not None:
-                self.battle_monitor = self.root.after(1000, self._check_battle_result)
-                
-        except Exception as e:
-            print(f"Error checking battle result: {e}")
-            traceback.print_exc()
-            # Try to recover from error
-            self._handle_failed_battle()
-            # If continuous mode is on, prepare next battle
-            if hasattr(self, 'continuous_var') and self.continuous_var.get():
-                self.root.after(2000, self._prepare_next_battle)
-            self.battle_monitor = None
-
-    def _handle_failed_battle(self):
-        """Handle and recover from failed battles"""
-        try:
-            timestamp = time.strftime("%H:%M:%S")
-            # Check if battle_log exists and create it if it doesn't
-            if not hasattr(self, 'battle_log') or not self.battle_log:
-                print("Warning: battle_log not initialized, creating it now")
-                log_frame = ttk.LabelFrame(self.battle_tab, text="Battle Log")
-                log_frame.pack(expand=True, fill="both", padx=10, pady=5)
-                self.battle_log = tk.Text(log_frame, height=10, wrap=tk.WORD)
-                self.battle_log.pack(side="left", expand=True, fill="both", padx=5, pady=5)
-                log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.battle_log.yview)
-                log_scrollbar.pack(side="right", fill="y")
-                self.battle_log.configure(yscrollcommand=log_scrollbar.set)
-            
-            self.battle_log.insert(tk.END, f"[{timestamp}] Battle failed - attempting recovery\n")
-            self.battle_log.see(tk.END)
-            
-            # Stop any existing processes
-            self.stop_battle()
-            
-            # Clear battle states
-            self.manager.current_battle = None
-            self.prepared_battle_info = None
-            self.battle_monitor = None
-            
-            # Reset Twitch betting if active
-            if self.twitch_bot and self.twitch_bot.betting_active:
-                asyncio.run_coroutine_threadsafe(
-                    self.twitch_bot.end_poll(),
-                    self.twitch_bot.loop
-                )
-            
-            # If in continuous mode, try to start next battle
-            if self.continuous_var.get():
-                self.battle_log.insert(tk.END, f"[{timestamp}] Attempting to start next battle\n")
-                self.battle_log.see(tk.END)
-                self.root.after(2000, self._prepare_next_battle)  # Wait 2 seconds before next battle
-                
-        except Exception as e:
-            print(f"Error in handle_failed_battle: {e}")
-            traceback.print_exc()
-
-    def _prepare_next_battle(self):
-        """Prepare and set up the next battle with error handling"""
-        try:
-            # Check if we already have a prepared battle
-            if hasattr(self, 'prepared_battle_info') and self.prepared_battle_info:
-                print("Battle already prepared, skipping preparation")
-                return
-
-            # Verify manager state
-            if not self.manager or not hasattr(self.manager, 'prepare_battle'):
-                raise RuntimeError("Battle manager not properly initialized")
-
-            # Verify we have enabled characters and stages
-            if not self.manager.settings["enabled_characters"]:
-                raise ValueError("No characters are enabled")
-            if not self.manager.settings["enabled_stages"]:
-                raise ValueError("No stages are enabled")
-
-            # Prepare next battle
-            self.prepared_battle_info = self.manager.prepare_battle()
-            print("Preparing next battle:", self.prepared_battle_info)
-            
-            if self.twitch_bot and self.twitch_bot.connected:
-                # Show preview and start betting for next battle
-                self.show_battle_preview(self.prepared_battle_info)
-                
-                if self.prepared_battle_info['mode'] == "single":
-                    title = f"{self.prepared_battle_info['p1']} vs {self.prepared_battle_info['p2']}"
-                    option1 = self.prepared_battle_info['p1']
-                    option2 = self.prepared_battle_info['p2']
-                else:
-                    title = "Team Battle"
-                    option1 = " & ".join(self.prepared_battle_info['p1'])
-                    option2 = " & ".join(self.prepared_battle_info['p2'])
-                
-                # Create poll with retry mechanism
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        poll_created = asyncio.run_coroutine_threadsafe(
-                            self.twitch_bot.create_battle_poll(title, option1, option2, self.betting_duration),
-                            self.twitch_bot.loop
-                        ).result(timeout=5)
-                        
-                        if poll_created:
-                            # Start betting timer
-                            self._update_betting_timer(self.betting_duration)
-                            break
-                        elif attempt < max_retries - 1:
-                            print(f"Failed to create poll, retrying ({attempt + 1}/{max_retries})")
-                            time.sleep(1)
-                        else:
-                            print("Failed to create poll after all retries")
-                            self._start_actual_battle()  # Start battle without betting
-                    except Exception as e:
-                        print(f"Error creating poll (attempt {attempt + 1}): {e}")
-                        if attempt == max_retries - 1:
-                            self._start_actual_battle()  # Start battle without betting
-            else:
-                # Start next battle immediately
-                self._start_actual_battle()
-                
-        except Exception as e:
-            print(f"Error preparing next battle: {e}")
-            traceback.print_exc()
-            # Log error
-            timestamp = time.strftime("%H:%M:%S")
-            if hasattr(self, 'battle_log'):
-                self.battle_log.insert(tk.END, f"[{timestamp}] Failed to prepare next battle: {str(e)}\n")
-                self.battle_log.see(tk.END)
-            # Clear the prepared battle info in case of error
-            self.prepared_battle_info = None
-            # Try again in 5 seconds if continuous mode is on
-            if self.continuous_var.get():
-                self.root.after(5000, self._prepare_next_battle)
-
-    def show_battle_preview(self, battle_info):
-        """Show battle preview in tab"""
-        try:
-            # Update the preview tab
-            self._update_preview_tab(battle_info)
-            
-        except Exception as e:
-            print(f"Error updating preview tab: {e}")
-            traceback.print_exc()
-
-    def _handle_battle_result(self, result):
-        """Handle the battle result and prepare next battle if needed"""
-        try:
-            # Update Twitch poll and handle payouts
-            if self.twitch_bot and hasattr(self, 'prepared_battle_info'):
-                winner = result.get('winner')
-                if winner:
-                    print(f"Processing winner: {winner}")
-                    # Use the bot's event loop to handle the battle result
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.twitch_bot.handle_battle_result(
-                            winner,
-                            self.prepared_battle_info['p1'],
-                            self.prepared_battle_info['p2']
-                        ),
-                        self.twitch_bot.loop
-                    )
-                    # Wait for the result to be processed with timeout
-                    try:
-                        future.result(timeout=10)  # Wait up to 10 seconds
-                    except asyncio.TimeoutError:
-                        print("Timeout while processing battle result")
-                    except Exception as e:
-                        print(f"Error processing battle result: {e}")
-                        traceback.print_exc()
-            
-            # Format and display result
-            timestamp = time.strftime("%H:%M:%S")
-            if result.get("mode") == "single":
-                result_text = (
-                    f"[{timestamp}] Battle Result:\n"
-                    f"{result['winner']} defeated {result['loser']}\n"
-                    f"Score: {result['p1_score']}-{result['p2_score']}\n"
-                )
-            else:
-                winner_team = " & ".join(result['winner'])
-                loser_team = " & ".join(result['loser'])
-                result_text = (
-                    f"[{timestamp}] Battle Result:\n"
-                    f"Team {winner_team} defeated Team {loser_team}\n"
-                    f"Score: {result['p1_score']}-{result['p2_score']}\n"
-                )
-            
-            # Log result to battle log
-            if hasattr(self, 'battle_log'):
-                self.battle_log.insert(tk.END, result_text)
-                self.battle_log.see(tk.END)
-            
-            # Update statistics view if available
-            if hasattr(self, '_update_stats_view'):
-                self._update_stats_view()
-            
-            # Clear current battle state
-            self.prepared_battle_info = None
-            self.manager.current_battle = None
-            
-            # If continuous mode is enabled, prepare next battle
-            if hasattr(self, 'continuous_var') and self.continuous_var.get():
-                # Add a small delay before preparing next battle
-                self.root.after(1000, self._prepare_next_battle)
-            else:
-                self.battle_monitor = None
-                
-        except Exception as e:
-            print(f"Error handling battle result: {e}")
-            traceback.print_exc()
-            # Try to recover
-            self._handle_failed_battle()
-            # Clear states
-            self.prepared_battle_info = None
-            self.manager.current_battle = None
-            self.battle_monitor = None
-
-    def _monitor_memory_usage(self):
-        """Monitor memory usage and clean up if necessary"""
-        try:
-            process = psutil.Process()
-            memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
-            
-            # Log high memory usage
-            if memory_usage > 500:  # Warning at 500MB
-                print(f"Warning: High memory usage detected: {memory_usage:.2f}MB")
-                
-            # Force cleanup at critical levels
-            if memory_usage > 1000:  # Critical at 1GB
-                print(f"Critical: Memory usage too high ({memory_usage:.2f}MB). Initiating cleanup...")
-                self.stop_battle()  # Stop current battle
-                self._force_cleanup()  # Additional cleanup
-                
-            # Schedule next check
-            self.root.after(30000, self._monitor_memory_usage)  # Check every 30 seconds
-            
-        except Exception as e:
-            print(f"Error monitoring memory: {e}")
-            traceback.print_exc()
-    
-    def _force_cleanup(self):
-        """Force cleanup of resources when memory usage is critical"""
-        try:
-            # Clear GUI elements
-            if hasattr(self, 'battle_log'):
-                self.battle_log.delete('1.0', tk.END)
-            
-            # Reset all battle states
-            self.manager.current_battle = None
-            self.prepared_battle_info = None
-            self.battle_monitor = None
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            # Kill any hanging processes
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    if proc.name().lower() in ['mugen.exe', 'mugenwatcher.exe']:
-                        proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-                    
-        except Exception as e:
-            print(f"Error during force cleanup: {e}")
-            traceback.print_exc()
+    def _setup_draggable_tabs(self):
+        """Setup drag and drop functionality for tabs"""
+        self.notebook.bind("<Button-1>", self._start_tab_drag)
+        self.notebook.bind("<B1-Motion>", self._drag_tab)
+        self.notebook.bind("<ButtonRelease-1>", self._release_tab)
 
     def _start_tab_drag(self, event):
-        """Begin tab drag operation"""
+        """Start tab dragging"""
         try:
-            index = self.notebook.index(f"@{event.x},{event.y}")
-            if index >= 0:  # Valid tab clicked
-                self._drag_data = {
-                    "x": event.x,
-                    "y": event.y,
-                    "index": index,
+            # Initialize drag data if not exists
+            if not hasattr(self, '_drag_data'):
+                self._drag_data = {}
+            
+            # Get tab number
+            try:
+                index = self.notebook.index("@%d,%d" % (event.x, event.y))
+                self._drag_data.update({
+                    "tab": index,
                     "dragging": True
-                }
-        except tk.TclError:
-            pass
+                })
+            except tk.TclError:
+                pass
+                
+        except Exception as e:
+            print("Error starting tab drag: %s" % str(e))
+            traceback.print_exc()
 
     def _drag_tab(self, event):
-        """Handle tab dragging motion"""
-        if not self._drag_data.get("dragging"):
-            return
-        
+        """Handle tab dragging"""
         try:
-            # Get current position
-            current = self.notebook.index(f"@{event.x},{event.y}")
-            original = self._drag_data["index"]
-            
-            # Only move if we're at a different valid position
-            if (current >= 0 and 
-                current != original and 
-                current < self.notebook.index('end')):
-                
-                # Get the moving tab
-                tab = self.notebook.select()
-                if not tab:
-                    return
-                
-                # Store tab info
-                text = self.notebook.tab(tab, "text")
-                
-                # Move the tab directly
-                self.notebook.insert(current, tab)
-                
-                # Update drag index
-                self._drag_data["index"] = current
-                
-                # Save the new order
-                self._save_tab_order(auto_save=False)
-                
-        except tk.TclError:
-            pass
-
-    def _release_tab(self, event):
-        """End tab drag operation"""
-        self._drag_data["dragging"] = False
-
-    def _move_tab(self, from_index: int, to_index: int):
-        """Move a tab from one position to another"""
-        try:
-            # Get all tab information first
-            tab_count = self.notebook.index('end')
-            if not (0 <= from_index < tab_count and 0 <= to_index < tab_count):
+            if not hasattr(self, '_drag_data') or not self._drag_data.get("dragging"):
                 return
+                
+            # Get current tab
+            x, y = event.x_root, event.y_root
+            src_tab = self._drag_data.get("tab")
+            
+            # Find target position
+            for i, tab_id in enumerate(self.notebook.tabs()):
+                bbox = self.notebook.bbox(tab_id)
+                if bbox:
+                    tab_x = bbox[0] + self.notebook.winfo_rootx()
+                    if x < tab_x + bbox[2]//2:
+                        if src_tab != i:
+                            self._move_tab(src_tab, i)
+                            self._drag_data["tab"] = i
+                        break
+                        
+        except Exception as e:
+            print("Error dragging tab: %s" % str(e))
+            traceback.print_exc()
+            
+    def _release_tab(self, event):
+        """Handle tab release after drag"""
+        try:
+            if hasattr(self, '_drag_data') and self._drag_data.get("dragging"):
+                self._drag_data["dragging"] = False
+                self._update_tab_references()
+        except Exception as e:
+            print("Error releasing tab: %s" % str(e))
+            traceback.print_exc()
 
-            # Store all tab information with their actual widgets
-            tabs = []
-            tab_widgets = self.notebook.winfo_children()
-            tab_ids = self.notebook.tabs()
-
-            for i in range(tab_count):
-                tab_id = tab_ids[i]
-                widget = tab_widgets[i]  # Get widget directly from winfo_children
-                text = self.notebook.tab(tab_id, "text")
-                tabs.append((widget, text))
-
-            # Remove all tabs (but don't destroy widgets)
-            while self.notebook.index('end') > 0:
-                self.notebook.forget(0)
-
-            # Create new order
-            tabs.insert(to_index, tabs.pop(from_index))
-
-            # Add all tabs back in new order
-            for widget, text in tabs:
-                self.notebook.add(widget, text=text)
-
-            # Select the moved tab
-            self.notebook.select(to_index)
-
-            # Update tab references based on text
-            for i, (widget, text) in enumerate(tabs):
-                if text == "Battle":
-                    self.battle_tab = widget
-                elif text == "Characters":
-                    self.characters_tab = widget
-                elif text == "Stages":
-                    self.stages_tab = widget
-                elif text == "Statistics":
-                    self.stats_tab = widget
-                elif text == "Settings":
-                    self.settings_tab = widget
-                elif text == "Battle Preview":
-                    self.preview_tab = widget
-                elif text == "Tournament":
-                    self.tournament_tab = widget
-
-            # Save the new order
-            self._save_tab_order(auto_save=False)
-
+    def _move_tab(self, src, dst):
+        """Move a tab from source to destination index"""
+        try:
+            tab = self.notebook.tabs()[src]
+            self.notebook.insert(dst, tab)
         except Exception as e:
             print(f"Error moving tab: {e}")
             traceback.print_exc()
             
-            # Recovery: try to restore tabs in original order
-            try:
-                for widget, text in tabs:
-                    self.notebook.add(widget, text=text)
-                # Restore tab references
-                self._update_tab_references()
-            except Exception as restore_error:
-                print(f"Failed to restore tabs: {restore_error}")
-
     def _update_tab_references(self):
-        """Update references to tab widgets after reordering"""
+        """Update tab references after drag and drop"""
         try:
-            for i, name in enumerate(self.tabs.keys()):
-                widget = self.notebook.winfo_children()[i]
-                if name == "Battle":
-                    self.battle_tab = widget
-                elif name == "Characters":
-                    self.characters_tab = widget
-                elif name == "Stages":
-                    self.stages_tab = widget
-                elif name == "Statistics":
-                    self.stats_tab = widget
-                elif name == "Settings":
-                    self.settings_tab = widget
-                elif name == "Battle Preview":
-                    self.preview_tab = widget
+            # Get the current tab order
+            tab_order = []
+            for tab_id in self.notebook.tabs():
+                tab_text = self.notebook.tab(tab_id, "text")
+                tab_order.append(tab_text)
+            
+            # Update settings
+            self.settings["tab_order"] = tab_order
+            
+            # Save if auto-save enabled
+            if self.settings.get("autosave", True):
+                self.save_config()
+                
         except Exception as e:
-            print(f"Error updating tab references: {e}")
+            print("Error updating tab references: %s" % str(e))
+            traceback.print_exc()
+            
+    def _save_tab_order(self, auto_save=True):
+        """Save current tab order to settings"""
+        try:
+            if not hasattr(self, 'settings'):
+                self.settings = {}
+                
+            tab_order = []
+            for tab in self.notebook.tabs():
+                try:
+                    tab_text = self.notebook.tab(tab, "text")
+                    if tab_text:  # Only add valid tab texts
+                        tab_order.append(tab_text)
+                except tk.TclError:
+                    continue
+            
+            self.settings["tab_order"] = tab_order
+            
+            # Auto-save if enabled and requested
+            if auto_save and hasattr(self, 'autosave_var') and self.autosave_var.get():
+                self.save_config()
+                
+        except Exception as e:
+            print(f"Error saving tab order: {e}")
+            traceback.print_exc()
+
+    def _load_tab_order(self):
+        """Load and apply saved tab order"""
+        try:
+            if "tab_order" in self.settings:
+                saved_order = self.settings["tab_order"]
+                current_tabs = {}
+                
+                # Create mapping of tab text to index
+                for i in range(self.notebook.index('end')):
+                    text = self.notebook.tab(i, "text")
+                    current_tabs[text] = i
+                
+                # Reorder tabs according to saved order
+                for i, tab_text in enumerate(saved_order):
+                    if tab_text in current_tabs:
+                        current_index = current_tabs[tab_text]
+                        if current_index != i:
+                            self._move_tab(current_index, i)
+        except Exception as e:
+            print(f"Error loading tab order: {e}")
             traceback.print_exc()
 
 if __name__ == "__main__":
