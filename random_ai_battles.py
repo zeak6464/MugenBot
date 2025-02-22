@@ -1238,11 +1238,13 @@ class TwitchBot(commands.Bot):
                 await self._connection.send(f"PRIVMSG #{self.channel_name} :Defeated: {loser_text}")
             
             if total_pool > 0:
-                # Calculate payout ratio
+                # Calculate payout ratio (minimum 1.1x, maximum from settings)
+                max_payout = float(self.battle_gui.max_payout_var.get())
                 if winning_pool > 0:
-                    payout_ratio = (total_pool / winning_pool) if winning_pool > 0 else 2.0
+                    payout_ratio = min(max_payout, (total_pool / winning_pool)) if winning_pool > 0 else max_payout
+                    payout_ratio = max(1.1, payout_ratio)  # Ensure minimum 1.1x payout
                 else:
-                    payout_ratio = 2.0  # Default 2x payout if no winners
+                    payout_ratio = max_payout  # Use max payout if no winners
                 
                 # Distribute winnings with timeout
                 async with asyncio.timeout(10):
@@ -1426,8 +1428,17 @@ class BattleGUI:
             "random_stage": True,
             "betting_enabled": False,
             "betting_duration": "30",
-            "tournament_size": 8
+            "tournament_size": 8,
+            "local_betting_enabled": False,
+            "local_num_players": 2,
+            "local_starting_points": 1000,
+            "local_betting_time": 30,
+            "local_min_bet": 100,
+            "local_max_bet": 5000
         }
+        
+        # Initialize betting manager
+        self.local_betting = LocalBettingManager()
         
         # Initialize variables
         self.mode_var = tk.StringVar(value=self.settings["battle_mode"])
@@ -1436,6 +1447,12 @@ class BattleGUI:
         self.betting_enabled_var = tk.BooleanVar(value=self.settings["betting_enabled"])
         self.betting_duration_var = tk.StringVar(value=self.settings["betting_duration"])
         self.tournament_size_var = tk.IntVar(value=self.settings["tournament_size"])
+        self.local_betting_enabled_var = tk.BooleanVar(value=self.settings["local_betting_enabled"])
+        self.num_players_var = tk.StringVar(value=str(self.settings["local_num_players"]))
+        self.local_starting_points_var = tk.StringVar(value=str(self.settings["local_starting_points"]))
+        self.local_betting_time_var = tk.StringVar(value=str(self.settings["local_betting_time"]))
+        self.min_bet_var = tk.StringVar(value=str(self.settings["local_min_bet"]))
+        self.max_bet_var = tk.StringVar(value=str(self.settings["local_max_bet"]))
         
         # Tournament state
         self.tournament = None
@@ -2166,45 +2183,61 @@ class BattleGUI:
     def _check_battle_result(self):
         """Check the result of the current battle"""
         try:
+            # First check if MUGEN is still running
+            if not self.manager._check_mugen_running():
+                # Get the final result before declaring the battle over
+                result = self.manager.check_battle_result()
+                if result:
+                    # Process the final result
+                    winner = result['winner']
+                    loser = result['loser']
+            
+            # Update battle log
+                    log_text = f"Battle Result: {winner} defeats {loser}\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+                # Handle local betting results
+                if self.local_betting_enabled_var.get() and hasattr(self, 'local_betting') and self.local_betting.betting_active:
+                    # Use current battle info from manager
+                    current_battle = self.manager.current_battle
+                    if current_battle:
+                        results = self.local_betting.handle_battle_result(winner, current_battle['p1'], current_battle['p2'])
+                        if results:
+                            result_text = "Betting Results:\n"
+                            for player, winnings, bet, profit in results:
+                                result_text += f"{player}: Won {winnings} points (Profit: {profit})\n"
+                            messagebox.showinfo("Betting Results", result_text)
+                            self.local_betting.save_state()
+                    
+                    # Handle Twitch betting results
+                    elif self.betting_enabled_var.get() and hasattr(self, 'twitch_bot') and self.twitch_bot.connected:
+                        asyncio.run_coroutine_threadsafe(
+                    self.twitch_bot.handle_battle_result(winner, result['p1'], result['p2']),
+                    self.twitch_bot.loop
+                )
+                    
+                    # Clean up the battle
+                    self.manager._cleanup_battle()
+                    
+                    # If continuous mode is enabled and not manually stopped, start next battle
+                    if hasattr(self, 'continuous_battles') and self.continuous_battles:
+                        # Start next battle after a short delay
+                        self.root.after(2000, self._start_battle)
+                    else:
+                        # Enable start button and disable stop button
+                        self.start_battle_btn.config(state='normal')
+                        self.stop_battle_btn.config(state='disabled')
+                else:
+                    # No result yet, check again in case it's just slow to update
+                    self.battle_monitor = self.root.after(1000, self._check_battle_result)
+                return
+            
+            # Check battle result while MUGEN is running
             result = self.manager.check_battle_result()
             if not result:
                 # Battle still ongoing, check again in 1 second
                 self.battle_monitor = self.root.after(1000, self._check_battle_result)
                 return
-                
-            # Process battle result
-            winner = result['winner']
-            loser = result['loser']
-            
-            # Update battle log
-            if hasattr(self, 'battle_log'):
-                timestamp = time.strftime("%H:%M:%S")
-                log_text = f"[{timestamp}] Battle Result: {winner} defeats {loser}\n"
-                self.battle_log.insert(tk.END, log_text)
-                self.battle_log.see(tk.END)
-            
-            # Clear battle monitor
-            self.battle_monitor = None
-            
-            # If this is a tournament battle, handle tournament progression
-            if hasattr(self, 'tournament_data') and self.tournament_data and self.tournament_data.get('active_match'):
-                self._check_tournament_battle()
-            elif hasattr(self, 'continuous_battles') and self.continuous_battles:
-                # Start next battle after a short delay if continuous battles enabled
-                self.root.after(2000, self._start_battle)
-            
-            # Enable tournament and battle controls
-            if hasattr(self, 'start_tournament_btn'):
-                self.start_tournament_btn.config(state='normal')
-            if hasattr(self, 'start_battle_btn'):
-                self.start_battle_btn.config(state='normal')
-
-            # If Twitch bot is connected, handle betting results
-            if hasattr(self, 'twitch_bot') and self.twitch_bot and self.twitch_bot.connected:
-                asyncio.run_coroutine_threadsafe(
-                    self.twitch_bot.handle_battle_result(winner, result['p1'], result['p2']),
-                    self.twitch_bot.loop
-                )
 
         except Exception as e:
             print(f"Error checking battle result: {e}")
@@ -2212,6 +2245,9 @@ class BattleGUI:
             if self.battle_monitor:
                 self.root.after_cancel(self.battle_monitor)
                 self.battle_monitor = None
+            # Re-enable start button and disable stop button
+            self.start_battle_btn.config(state='normal')
+            self.stop_battle_btn.config(state='disabled')
 
     def _sort_stats(self, column):
         """Sort statistics list by column"""
@@ -2262,36 +2298,23 @@ class BattleGUI:
     def save_config(self):
         """Save current configuration to file"""
         try:
-            # Check if window still exists
-            if not self.root.winfo_exists():
-                print("Window destroyed, skipping config save")
-                return
-                
             config = {
                 "mugen_path": str(self.manager.mugen_path),
                 "theme": self.settings.get("theme", "default"),
                 "tab_order": self.settings.get("tab_order", []),
-                "battle_mode": self.mode_var.get() if hasattr(self, 'mode_var') else "single",
-                "ai_level": self.ai_level_var.get() if hasattr(self, 'ai_level_var') else "4",
-                "random_stage": self.random_stage_var.get() if hasattr(self, 'random_stage_var') else True,
-                "betting_enabled": self.betting_enabled_var.get() if hasattr(self, 'betting_enabled_var') else False,
-                "betting_duration": self.betting_duration_var.get() if hasattr(self, 'betting_duration_var') else "30",
-                "tournament_size": self.tournament_size_var.get() if hasattr(self, 'tournament_size_var') else 8
+                "battle_mode": self.mode_var.get(),
+                "ai_level": self.ai_level_var.get(),
+                "random_stage": self.random_stage_var.get(),
+                "betting_enabled": self.betting_enabled_var.get(),
+                "betting_duration": self.betting_duration_var.get(),
+                "tournament_size": self.tournament_size_var.get(),
+                "local_betting_enabled": self.local_betting_enabled_var.get(),
+                "local_num_players": int(self.num_players_var.get()),
+                "local_starting_points": int(self.local_starting_points_var.get()),
+                "local_betting_time": int(self.local_betting_time_var.get()),
+                "local_min_bet": int(self.min_bet_var.get()),
+                "local_max_bet": int(self.max_bet_var.get())
             }
-            
-            # Save enabled characters
-            if hasattr(self, 'character_tree') and self.character_tree.winfo_exists():
-                config["enabled_characters"] = []
-                for item in self.character_tree.get_children():
-                    if self.character_tree.set(item, "enabled") == "1":
-                        config["enabled_characters"].append(self.character_tree.item(item)["text"])
-                        
-            # Save enabled stages
-            if hasattr(self, 'stage_tree') and self.stage_tree.winfo_exists():
-                config["enabled_stages"] = []
-                for item in self.stage_tree.get_children():
-                    if self.stage_tree.set(item, "enabled") == "1":
-                        config["enabled_stages"].append(self.stage_tree.item(item)["text"])
             
             # Save to file
             with open('config.json', 'w') as f:
@@ -2320,6 +2343,24 @@ class BattleGUI:
                 self.betting_enabled_var.set(config.get("betting_enabled", False))
                 self.betting_duration_var.set(config.get("betting_duration", "30"))
                 self.tournament_size_var.set(config.get("tournament_size", 8))
+                self.local_betting_enabled_var.set(config.get("local_betting_enabled", False))
+                self.num_players_var.set(str(config.get("local_num_players", 2)))
+                self.local_starting_points_var.set(str(config.get("local_starting_points", 1000)))
+                self.local_betting_time_var.set(str(config.get("local_betting_time", 30)))
+                self.min_bet_var.set(str(config.get("local_min_bet", 100)))
+                self.max_bet_var.set(str(config.get("local_max_bet", 5000)))
+                
+                # Load Twitch settings
+                if hasattr(self, 'channel_var'):
+                    self.channel_var.set(config.get("twitch_channel", ""))
+                if hasattr(self, 'bot_name_var'):
+                    self.bot_name_var.set(config.get("twitch_bot_name", ""))
+                if hasattr(self, 'token_var'):
+                    self.token_var.set(config.get("twitch_token", ""))
+                if hasattr(self, 'starting_points_var'):
+                    self.starting_points_var.set(config.get("starting_points", "1000"))
+                if hasattr(self, 'max_payout_var'):
+                    self.max_payout_var.set(config.get("max_payout_multiplier", "2.0"))
                 
                 # Update manager settings
                 if "enabled_characters" in config:
@@ -2381,41 +2422,51 @@ class BattleGUI:
         control_frame = ttk.Frame(battle_frame)
         control_frame.pack(fill='x', padx=10, pady=5)
         
-        # Add battle mode selection
+        # Battle Mode
         mode_label = ttk.Label(control_frame, text="Battle Mode:")
-        mode_label.pack(side='left', padx=5)
+        mode_label.pack(side='left')
         
         mode_combo = ttk.Combobox(control_frame, textvariable=self.mode_var, 
-                                 values=["single", "simul"], state='readonly')
-        mode_combo.pack(side='left', padx=5)
+                                 values=["single", "simul"], state='readonly', width=10)
+        mode_combo.pack(side='left', padx=(0, 10))
         
-        # Add AI level selection
+        # AI Level
         ai_label = ttk.Label(control_frame, text="AI Level:")
-        ai_label.pack(side='left', padx=5)
+        ai_label.pack(side='left')
         
         ai_combo = ttk.Combobox(control_frame, textvariable=self.ai_level_var,
-                               values=["1", "2", "3", "4", "5", "6", "7", "8"], state='readonly')
-        ai_combo.pack(side='left', padx=5)
+                               values=["1", "2", "3", "4", "5", "6", "7", "8"], 
+                               state='readonly', width=5)
+        ai_combo.pack(side='left', padx=(0, 10))
         
-        # Add random stage toggle
+        # Random Stage toggle
         random_stage_check = ttk.Checkbutton(control_frame, text="Random Stage",
                                            variable=self.random_stage_var)
-        random_stage_check.pack(side='left', padx=5)
+        random_stage_check.pack(side='left', padx=(0, 10))
+
+        # Continuous Mode toggle
+        self.continuous_mode_var = tk.BooleanVar(value=False)
+        continuous_mode_check = ttk.Checkbutton(control_frame, text="Continuous Mode",
+                                              variable=self.continuous_mode_var)
+        continuous_mode_check.pack(side='left', padx=(0, 10))
         
-        # Add start battle button
+        # Start Battle button
         self.start_battle_btn = ttk.Button(control_frame, text="Start Battle",
                                          command=self._start_battle)
         self.start_battle_btn.pack(side='right', padx=5)
         
-        # Add battle log
-        log_frame = ttk.Frame(battle_frame)
-        log_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        # Stop Battle button
+        self.stop_battle_btn = ttk.Button(control_frame, text="Stop Battle",
+                                        command=self._stop_battle, state='disabled')
+        self.stop_battle_btn.pack(side='right', padx=5)
         
-        log_label = ttk.Label(log_frame, text="Battle Log:")
-        log_label.pack(anchor='w')
+        # Battle Log label
+        log_label = ttk.Label(battle_frame, text="Battle Log:")
+        log_label.pack(anchor='w', padx=10, pady=(5, 0))
         
-        self.battle_log = ScrolledText(log_frame, height=20)
-        self.battle_log.pack(fill='both', expand=True)
+        # Battle Log text area
+        self.battle_log = ScrolledText(battle_frame, height=20)
+        self.battle_log.pack(fill='both', expand=True, padx=10, pady=5)
 
     def _setup_characters_tab(self):
         """Setup the characters tab with character list and controls"""
@@ -2549,7 +2600,7 @@ class BattleGUI:
         settings_frame = self.tabs['Settings']
         
         # Create settings frame
-        options_frame = ttk.LabelFrame(settings_frame, text="Options")
+        options_frame = ttk.LabelFrame(settings_frame, text="General Options")
         options_frame.pack(fill='x', padx=10, pady=5)
         
         # Add auto-save option
@@ -2558,24 +2609,159 @@ class BattleGUI:
                                        variable=self.autosave_var)
         autosave_check.pack(anchor='w', padx=5, pady=5)
         
+        # Add Local Betting settings
+        local_betting_frame = ttk.LabelFrame(settings_frame, text="Local Betting")
+        local_betting_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Enable local betting
+        local_betting_check = ttk.Checkbutton(local_betting_frame, text="Enable local betting",
+                                           variable=self.local_betting_enabled_var)
+        local_betting_check.pack(anchor='w', padx=5, pady=5)
+        
+        # Number of players
+        players_frame = ttk.Frame(local_betting_frame)
+        players_frame.pack(fill='x', padx=5, pady=2)
+        players_label = ttk.Label(players_frame, text="Number of players:")
+        players_label.pack(side='left', padx=5)
+        players_spinbox = ttk.Spinbox(players_frame, from_=2, to=8,
+                                    textvariable=self.num_players_var,
+                                    width=5)
+        players_spinbox.pack(side='left', padx=5)
+        
+        # Starting points
+        points_frame = ttk.Frame(local_betting_frame)
+        points_frame.pack(fill='x', padx=5, pady=2)
+        points_label = ttk.Label(points_frame, text="Starting points:")
+        points_label.pack(side='left', padx=5)
+        points_entry = ttk.Entry(points_frame, textvariable=self.local_starting_points_var,
+                               width=10)
+        points_entry.pack(side='left', padx=5)
+        
+        # Betting time limit
+        time_frame = ttk.Frame(local_betting_frame)
+        time_frame.pack(fill='x', padx=5, pady=2)
+        time_label = ttk.Label(time_frame, text="Betting time limit (seconds):")
+        time_label.pack(side='left', padx=5)
+        time_entry = ttk.Entry(time_frame, textvariable=self.local_betting_time_var,
+                             width=10)
+        time_entry.pack(side='left', padx=5)
+        
+        # Minimum bet
+        min_bet_frame = ttk.Frame(local_betting_frame)
+        min_bet_frame.pack(fill='x', padx=5, pady=2)
+        min_bet_label = ttk.Label(min_bet_frame, text="Minimum bet:")
+        min_bet_label.pack(side='left', padx=5)
+        min_bet_entry = ttk.Entry(min_bet_frame, textvariable=self.min_bet_var,
+                                width=10)
+        min_bet_entry.pack(side='left', padx=5)
+        
+        # Maximum bet
+        max_bet_frame = ttk.Frame(local_betting_frame)
+        max_bet_frame.pack(fill='x', padx=5, pady=2)
+        max_bet_label = ttk.Label(max_bet_frame, text="Maximum bet:")
+        max_bet_label.pack(side='left', padx=5)
+        max_bet_entry = ttk.Entry(max_bet_frame, textvariable=self.max_bet_var,
+                                width=10)
+        max_bet_entry.pack(side='left', padx=5)
+        
         # Add Twitch integration settings
         twitch_frame = ttk.LabelFrame(settings_frame, text="Twitch Integration")
         twitch_frame.pack(fill='x', padx=10, pady=5)
         
+        # Connection settings
+        conn_frame = ttk.LabelFrame(twitch_frame, text="Connection Settings")
+        conn_frame.pack(fill='x', padx=5, pady=5)
+        
+        # Bot Token
+        token_frame = ttk.Frame(conn_frame)
+        token_frame.pack(fill='x', padx=5, pady=2)
+        token_label = ttk.Label(token_frame, text="OAuth Token:")
+        token_label.pack(side='left', padx=5)
+        self.token_var = tk.StringVar()
+        token_entry = ttk.Entry(token_frame, textvariable=self.token_var, show="*")
+        token_entry.pack(side='left', fill='x', expand=True, padx=5)
+        token_help = ttk.Button(token_frame, text="?", width=2,
+                              command=lambda: webbrowser.open('https://twitchapps.com/tmi/'))
+        token_help.pack(side='left', padx=2)
+        
+        # Channel Name
+        channel_frame = ttk.Frame(conn_frame)
+        channel_frame.pack(fill='x', padx=5, pady=2)
+        channel_label = ttk.Label(channel_frame, text="Channel Name:")
+        channel_label.pack(side='left', padx=5)
+        self.channel_var = tk.StringVar()
+        channel_entry = ttk.Entry(channel_frame, textvariable=self.channel_var)
+        channel_entry.pack(side='left', fill='x', expand=True, padx=5)
+        
+        # Bot Name
+        bot_frame = ttk.Frame(conn_frame)
+        bot_frame.pack(fill='x', padx=5, pady=2)
+        bot_label = ttk.Label(bot_frame, text="Bot Name:")
+        bot_label.pack(side='left', padx=5)
+        self.bot_name_var = tk.StringVar()
+        bot_entry = ttk.Entry(bot_frame, textvariable=self.bot_name_var)
+        bot_entry.pack(side='left', fill='x', expand=True, padx=5)
+        
+        # Connection buttons
+        btn_frame = ttk.Frame(conn_frame)
+        btn_frame.pack(fill='x', padx=5, pady=5)
+        
+        self.connect_btn = ttk.Button(btn_frame, text="Connect",
+                                    command=self._connect_twitch)
+        self.connect_btn.pack(side='left', padx=5)
+        
+        self.disconnect_btn = ttk.Button(btn_frame, text="Disconnect",
+                                       command=self._disconnect_twitch,
+                                       state='disabled')
+        self.disconnect_btn.pack(side='left', padx=5)
+        
+        # Connection status
+        self.twitch_status = ttk.Label(conn_frame, text="Status: Disconnected",
+                                     foreground='red')
+        self.twitch_status.pack(padx=5, pady=5)
+        
         # Betting settings
-        betting_check = ttk.Checkbutton(twitch_frame, text="Enable betting",
+        betting_frame = ttk.LabelFrame(twitch_frame, text="Betting Settings")
+        betting_frame.pack(fill='x', padx=5, pady=5)
+        
+        # Enable betting
+        betting_check = ttk.Checkbutton(betting_frame, text="Enable betting",
                                       variable=self.betting_enabled_var)
         betting_check.pack(anchor='w', padx=5, pady=5)
         
-        duration_frame = ttk.Frame(twitch_frame)
+        # Betting duration
+        duration_frame = ttk.Frame(betting_frame)
         duration_frame.pack(fill='x', padx=5, pady=5)
-        
         duration_label = ttk.Label(duration_frame, text="Betting duration (seconds):")
         duration_label.pack(side='left', padx=5)
-        
         duration_entry = ttk.Entry(duration_frame, textvariable=self.betting_duration_var,
                                  width=10)
         duration_entry.pack(side='left', padx=5)
+        
+        # Starting points
+        points_frame = ttk.Frame(betting_frame)
+        points_frame.pack(fill='x', padx=5, pady=5)
+        points_label = ttk.Label(points_frame, text="Starting points for new users:")
+        points_label.pack(side='left', padx=5)
+        self.starting_points_var = tk.StringVar(value="1000")
+        points_entry = ttk.Entry(points_frame, textvariable=self.starting_points_var,
+                               width=10)
+        points_entry.pack(side='left', padx=5)
+        
+        # Payout multiplier
+        payout_frame = ttk.Frame(betting_frame)
+        payout_frame.pack(fill='x', padx=5, pady=5)
+        payout_label = ttk.Label(payout_frame, text="Maximum payout multiplier:")
+        payout_label.pack(side='left', padx=5)
+        self.max_payout_var = tk.StringVar(value="2.0")
+        payout_entry = ttk.Entry(payout_frame, textvariable=self.max_payout_var,
+                               width=10)
+        payout_entry.pack(side='left', padx=5)
+        
+        # Save settings button
+        save_btn = ttk.Button(settings_frame, text="Save Settings",
+                            command=self._save_twitch_settings)
+        save_btn.pack(pady=10)
 
     def create_menu(self):
         """Create the application menu"""
@@ -2789,14 +2975,45 @@ class BattleGUI:
     def _start_battle(self):
         """Start a new battle"""
         try:
-            # Disable battle controls
-            self.start_battle_btn.config(state='disabled')
-            
-            # Check if betting is enabled
-            if self.betting_enabled_var.get() and hasattr(self, 'twitch_bot') and self.twitch_bot.connected:
-                # Prepare battle info
-                battle_info = self.manager.prepare_battle()
+            # Check if battle is already running
+            if self.manager._check_mugen_running():
+                print("Battle already in progress")
+                return
                 
+            # Disable start button and enable stop button
+            self.start_battle_btn.config(state='disabled')
+            self.stop_battle_btn.config(state='normal')
+            
+            # Set continuous battles flag
+            self.continuous_battles = self.continuous_mode_var.get()
+            
+            # Prepare battle info and store it
+            self.manager.current_battle = self.manager.prepare_battle()
+            battle_info = self.manager.current_battle
+            
+            # Update preview immediately
+            self._update_preview(battle_info)
+            
+            # Handle betting based on settings
+            if self.local_betting_enabled_var.get():
+                # Initialize local betting if not already done
+                if not self.local_betting.players:
+                    num_players = int(self.num_players_var.get())
+                    starting_points = int(self.local_starting_points_var.get())
+                    self.local_betting.initialize_players(num_players, starting_points)
+                
+                # Activate betting
+                self.local_betting.betting_active = True
+                
+                # Show betting window
+                betting_window = BettingWindow(self, self.local_betting, battle_info)
+                self.root.wait_window(betting_window)
+                
+                # Start battle after betting window closes
+                self._start_actual_battle()
+                
+            elif self.betting_enabled_var.get() and hasattr(self, 'twitch_bot') and self.twitch_bot.connected:
+                # Handle Twitch betting
                 # Format team names
                 if battle_info['mode'] == "single":
                     team1 = battle_info['p1']
@@ -2817,66 +3034,284 @@ class BattleGUI:
                     self.twitch_bot.loop
                 )
                 
-                # Update preview
-                self._update_preview(battle_info)
-                
                 # Start timer
                 self._update_betting_timer(duration)
-            else:
-                # Start battle immediately
+                return  # Return here as the timer will call _start_actual_battle
+            
+            # If no betting, start battle immediately
                 self._start_actual_battle()
                 
         except Exception as e:
             print(f"Error starting battle: {e}")
             traceback.print_exc()
             self.start_battle_btn.config(state='normal')
+            self.stop_battle_btn.config(state='disabled')
 
-    def _start_actual_battle(self):
-        """Start the actual battle after betting period (if any)"""
+    def _stop_battle(self):
+        """Stop the current battle and continuous mode"""
         try:
-            # Start the battle
-            battle_info = self.manager.start_battle()
+            # Stop continuous battles
+            self.continuous_battles = False
             
-            # Update preview
-            self._update_preview(battle_info)
+            # Cancel battle monitor if running
+            if hasattr(self, 'battle_monitor') and self.battle_monitor:
+                self.root.after_cancel(self.battle_monitor)
+                self.battle_monitor = None
             
-            # Start battle monitor
-            self._check_battle_result()
+            # Update buttons
+            self.start_battle_btn.config(state='normal')
+            self.stop_battle_btn.config(state='disabled')
             
-            # Log battle start
+            # Log battle stop
             if hasattr(self, 'battle_log'):
                 timestamp = time.strftime("%H:%M:%S")
-                if battle_info['mode'] == "single":
-                    log_text = f"[{timestamp}] Battle Started: {battle_info['p1']} vs {battle_info['p2']} on {battle_info['stage']}\n"
-                else:
-                    team1 = " & ".join(battle_info['p1'])
-                    team2 = " & ".join(battle_info['p2'])
-                    log_text = f"[{timestamp}] Team Battle Started: {team1} vs {team2} on {battle_info['stage']}\n"
+                log_text = f"[{timestamp}] Battles stopped by user\n"
                 self.battle_log.insert(tk.END, log_text)
                 self.battle_log.see(tk.END)
+            
+            # Handle any active betting
+            if self.local_betting_enabled_var.get() and self.local_betting.betting_active:
+                # Return bets to players
+                for team, team_bets in self.local_betting.current_bets.items():
+                    for player, bet in team_bets.items():
+                        self.local_betting.players[player]["points"] += bet
+                        self.local_betting.log_bet(f"Returned {bet} points to {player} due to battle stop")
+                
+                # Reset betting state
+                self.local_betting.betting_active = False
+                self.local_betting.current_bets = {"1": {}, "2": {}}
+                self.local_betting.save_state()
                 
         except Exception as e:
-            print(f"Error starting actual battle: {e}")
+            print(f"Error stopping battle: {e}")
             traceback.print_exc()
+            # Ensure buttons are in correct state even on error
             self.start_battle_btn.config(state='normal')
+            self.stop_battle_btn.config(state='disabled')
 
-    def _update_preview(self, battle_info):
-        """Update the preview tab with current battle information"""
+    def _check_battle_result(self):
+        """Check the result of the current battle"""
         try:
-            if battle_info['mode'] == "single":
-                # Update team displays
-                self._create_team_display(self.team1_frame, [battle_info['p1']], "Team 1", "left")
-                self._create_team_display(self.team2_frame, [battle_info['p2']], "Team 2", "right")
-            else:
-                # Update team displays for team battle
-                self._create_team_display(self.team1_frame, battle_info['p1'], "Team 1", "left")
-                self._create_team_display(self.team2_frame, battle_info['p2'], "Team 2", "right")
+            # First check if MUGEN is still running
+            if not self.manager._check_mugen_running():
+                # Get the final result before declaring the battle over
+                result = self.manager.check_battle_result()
+                if result:
+                    # Process the final result
+                    winner = result['winner']
+                    loser = result['loser']
+                    
+                    # Update battle log
+                    log_text = f"Battle Result: {winner} defeats {loser}\n"
+                    self.battle_log.insert(tk.END, log_text)
+                    self.battle_log.see(tk.END)
+                    
+                    # Handle local betting results
+                    if self.local_betting_enabled_var.get() and hasattr(self, 'local_betting') and self.local_betting.betting_active:
+                        # Use current battle info from manager
+                        current_battle = self.manager.current_battle
+                        if current_battle:
+                            results = self.local_betting.handle_battle_result(winner, current_battle['p1'], current_battle['p2'])
+                            if results:
+                                result_text = "Betting Results:\n"
+                                for player, winnings, bet, profit in results:
+                                    result_text += f"{player}: Won {winnings} points (Profit: {profit})\n"
+                                messagebox.showinfo("Betting Results", result_text)
+                                self.local_betting.save_state()
+                    
+                    # Handle Twitch betting results
+                    elif self.betting_enabled_var.get() and hasattr(self, 'twitch_bot') and self.twitch_bot.connected:
+                        asyncio.run_coroutine_threadsafe(
+                            self.twitch_bot.handle_battle_result(winner, result['p1'], result['p2']),
+                            self.twitch_bot.loop
+                        )
+                    
+                    # Clean up the battle
+                    self.manager._cleanup_battle()
+                    
+                    # If continuous mode is enabled and not manually stopped, start next battle
+                    if hasattr(self, 'continuous_battles') and self.continuous_battles:
+                        # Start next battle after a short delay
+                        self.root.after(2000, self._start_battle)
+                    else:
+                        # Enable start button and disable stop button
+                        self.start_battle_btn.config(state='normal')
+                        self.stop_battle_btn.config(state='disabled')
+                else:
+                    # No result yet, check again in case it's just slow to update
+                    self.battle_monitor = self.root.after(1000, self._check_battle_result)
+                return
             
-            # Update stage preview
-            self.stage_preview.configure(image=self.placeholder_stage)
+            # Check battle result while MUGEN is running
+            result = self.manager.check_battle_result()
+            if not result:
+                # Battle still ongoing, check again in 1 second
+                self.battle_monitor = self.root.after(1000, self._check_battle_result)
+                return
+
+        except Exception as e:
+            print(f"Error checking battle result: {e}")
+            traceback.print_exc()
+            if self.battle_monitor:
+                self.root.after_cancel(self.battle_monitor)
+                self.battle_monitor = None
+            # Re-enable start button and disable stop button
+            self.start_battle_btn.config(state='normal')
+            self.stop_battle_btn.config(state='disabled')
+
+    def _connect_twitch(self):
+        """Connect to Twitch chat"""
+        try:
+            # Get connection settings
+            token = self.token_var.get().strip()
+            channel = self.channel_var.get().strip()
+            bot_name = self.bot_name_var.get().strip()
+            
+            # Validate inputs
+            if not all([token, channel, bot_name]):
+                messagebox.showerror("Error", "Please fill in all Twitch connection settings")
+                return
+                
+            if not token.startswith('oauth:'):
+                messagebox.showerror("Error", "Invalid OAuth token format. Get your token from https://twitchapps.com/tmi/")
+                return
+            
+            # Create and start Twitch bot
+            self.twitch_bot = TwitchBot(token, channel, self, bot_name)
+            
+            # Start bot in a separate thread
+            self.bot_thread = threading.Thread(target=self._run_twitch_bot)
+            self.bot_thread.daemon = True
+            self.bot_thread.start()
+            
+            # Update UI
+            self.connect_btn.config(state='disabled')
+            self.disconnect_btn.config(state='normal')
+            self.twitch_status.config(text="Status: Connecting...", foreground='orange')
             
         except Exception as e:
-            print(f"Error updating preview: {e}")
+            messagebox.showerror("Error", f"Failed to connect to Twitch: {str(e)}")
+            print(f"Twitch connection error: {e}")
+            traceback.print_exc()
+            self.twitch_status.config(text="Status: Connection Failed", foreground='red')
+
+    def _disconnect_twitch(self):
+        """Disconnect from Twitch chat"""
+        try:
+            if hasattr(self, 'twitch_bot') and self.twitch_bot:
+                # Close bot connection
+                asyncio.run_coroutine_threadsafe(
+                    self.twitch_bot.close(),
+                    self.twitch_bot.loop
+                )
+                self.twitch_bot = None
+            
+            # Update UI
+            self.connect_btn.config(state='normal')
+            self.disconnect_btn.config(state='disabled')
+            self.twitch_status.config(text="Status: Disconnected", foreground='red')
+            
+        except Exception as e:
+            print(f"Error disconnecting from Twitch: {e}")
+            traceback.print_exc()
+
+    def _run_twitch_bot(self):
+        """Run the Twitch bot in a separate thread"""
+        try:
+            self.twitch_bot.run()
+        except Exception as e:
+            print(f"Error running Twitch bot: {e}")
+            traceback.print_exc()
+            # Update UI from main thread
+            self.root.after(0, self._handle_bot_error, str(e))
+
+    def _handle_bot_error(self, error_msg):
+        """Handle Twitch bot errors"""
+        self.twitch_status.config(text=f"Status: Error - {error_msg}", foreground='red')
+        self.connect_btn.config(state='normal')
+        self.disconnect_btn.config(state='disabled')
+
+    def update_twitch_status(self, connected):
+        """Update Twitch connection status"""
+        if connected:
+            self.twitch_status.config(text="Status: Connected", foreground='green')
+            self.connect_btn.config(state='disabled')
+            self.disconnect_btn.config(state='normal')
+        else:
+            self.twitch_status.config(text="Status: Disconnected", foreground='red')
+            self.connect_btn.config(state='normal')
+            self.disconnect_btn.config(state='disabled')
+
+    def _save_twitch_settings(self):
+        """Save Twitch settings to configuration"""
+        try:
+            # Update settings dictionary
+            self.settings.update({
+                "twitch_channel": self.channel_var.get().strip(),
+                "twitch_bot_name": self.bot_name_var.get().strip(),
+                "twitch_token": self.token_var.get().strip(),
+                "betting_enabled": self.betting_enabled_var.get(),
+                "betting_duration": self.betting_duration_var.get(),
+                "starting_points": self.starting_points_var.get(),
+                "max_payout_multiplier": self.max_payout_var.get()
+            })
+            
+            # Save configuration
+            self.save_config()
+            
+            messagebox.showinfo("Success", "Twitch settings saved successfully")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
+            print(f"Error saving Twitch settings: {e}")
+            traceback.print_exc()
+
+    def load_config(self):
+        """Load configuration from file"""
+        try:
+            if Path('config.json').exists():
+                with open('config.json', 'r') as f:
+                    config = json.load(f)
+                    
+                # Update settings
+                self.settings.update(config)
+                
+                # Update variables with loaded values
+                self.mode_var.set(config.get("battle_mode", "single"))
+                self.ai_level_var.set(config.get("ai_level", "4"))
+                self.random_stage_var.set(config.get("random_stage", True))
+                self.betting_enabled_var.set(config.get("betting_enabled", False))
+                self.betting_duration_var.set(config.get("betting_duration", "30"))
+                self.tournament_size_var.set(config.get("tournament_size", 8))
+                self.local_betting_enabled_var.set(config.get("local_betting_enabled", False))
+                self.num_players_var.set(str(config.get("local_num_players", 2)))
+                self.local_starting_points_var.set(str(config.get("local_starting_points", 1000)))
+                self.local_betting_time_var.set(str(config.get("local_betting_time", 30)))
+                self.min_bet_var.set(str(config.get("local_min_bet", 100)))
+                self.max_bet_var.set(str(config.get("local_max_bet", 5000)))
+                
+                # Load Twitch settings
+                if hasattr(self, 'channel_var'):
+                    self.channel_var.set(config.get("twitch_channel", ""))
+                if hasattr(self, 'bot_name_var'):
+                    self.bot_name_var.set(config.get("twitch_bot_name", ""))
+                if hasattr(self, 'token_var'):
+                    self.token_var.set(config.get("twitch_token", ""))
+                if hasattr(self, 'starting_points_var'):
+                    self.starting_points_var.set(config.get("starting_points", "1000"))
+                if hasattr(self, 'max_payout_var'):
+                    self.max_payout_var.set(config.get("max_payout_multiplier", "2.0"))
+                
+                # Update manager settings
+                if "enabled_characters" in config:
+                    self.manager.settings["enabled_characters"] = set(config["enabled_characters"])
+                if "enabled_stages" in config:
+                    self.manager.settings["enabled_stages"] = set(config["enabled_stages"])
+                    
+                print("Configuration loaded successfully")
+                
+        except Exception as e:
+            print(f"Error loading config: {e}")
             traceback.print_exc()
 
     def _show_about(self):
@@ -2889,11 +3324,427 @@ Features:
 - Character and stage management
 - Battle statistics tracking
 - Twitch integration with betting system
+- Local betting system with logging
+- Tournament mode with brackets
+- Continuous battle mode
 - Automatic configuration saving
 
 Created with Python and Tkinter."""
-
         messagebox.showinfo("About", about_text)
+
+    def _start_actual_battle(self):
+        """Start the actual battle after betting period (if any)"""
+        try:
+            # Check if MUGEN is already running
+            if self.manager._check_mugen_running():
+                print("MUGEN is already running, waiting for current battle to finish")
+                return
+            
+            # Use the stored battle info
+            battle_info = self.manager.current_battle
+            if not battle_info:
+                print("No battle info available")
+                self.start_battle_btn.config(state='normal')
+                self.stop_battle_btn.config(state='disabled')
+                return
+            
+            # Start the battle
+            self.manager.start_battle(battle_info)
+            
+            # Log battle start
+            if hasattr(self, 'battle_log'):
+                timestamp = time.strftime("%H:%M:%S")
+                if battle_info['mode'] == "single":
+                    log_text = f"[{timestamp}] Battle Started: {battle_info['p1']} vs {battle_info['p2']} on {battle_info['stage']}\n"
+                else:
+                    team1 = " & ".join(battle_info['p1'])
+                    team2 = " & ".join(battle_info['p2'])
+                    log_text = f"[{timestamp}] Team Battle Started: {team1} vs {team2} on {battle_info['stage']}\n"
+                self.battle_log.insert(tk.END, log_text)
+                self.battle_log.see(tk.END)
+            
+            # Start battle monitor
+            self._check_battle_result()
+                
+        except Exception as e:
+            print(f"Error starting actual battle: {e}")
+            traceback.print_exc()
+            # Re-enable battle controls on error
+            self.start_battle_btn.config(state='normal')
+            self.stop_battle_btn.config(state='disabled')
+
+    def _update_preview(self, battle_info):
+        """Update the preview tab with current battle information"""
+        try:
+            # Clear existing team displays
+            for widget in self.team1_frame.winfo_children():
+                widget.destroy()
+            for widget in self.team2_frame.winfo_children():
+                widget.destroy()
+            
+            # Update team displays based on battle mode
+            if battle_info['mode'] == "single":
+                # Single battle mode
+                self._create_team_display(self.team1_frame, [battle_info['p1']], "Team 1", "left")
+                self._create_team_display(self.team2_frame, [battle_info['p2']], "Team 2", "right")
+            else:
+                # Team battle mode
+                self._create_team_display(self.team1_frame, battle_info['p1'], "Team 1", "left")
+                self._create_team_display(self.team2_frame, battle_info['p2'], "Team 2", "right")
+            
+            # Update stage preview
+            stage_name = battle_info['stage']
+            stage_path = Path(f"stages/{stage_name}")
+            
+            # Try to load stage preview image
+            try:
+                # Look for preview image in stage folder
+                preview_files = list(stage_path.glob("*.png")) + list(stage_path.glob("*.jpg"))
+                if preview_files:
+                    image = Image.open(preview_files[0])
+                    # Resize image to fit preview
+                    image = image.resize((200, 200), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(image)
+                    self.stage_preview.configure(image=photo)
+                    self.stage_preview.image = photo  # Keep reference
+                else:
+                    # Use placeholder if no preview found
+                    self.stage_preview.configure(image=self.placeholder_stage)
+            except Exception as e:
+                print(f"Error loading stage preview: {e}")
+                # Use placeholder on error
+            self.stage_preview.configure(image=self.placeholder_stage)
+            
+            # Update betting totals if available
+            if hasattr(self, 'preview_team1_total'):
+                team1_total = sum(self.local_betting.current_bets["1"].values()) if self.local_betting else 0
+                self.preview_team1_total.config(text=f"{team1_total:,}")
+            if hasattr(self, 'preview_team2_total'):
+                team2_total = sum(self.local_betting.current_bets["2"].values()) if self.local_betting else 0
+                self.preview_team2_total.config(text=f"{team2_total:,}")
+            
+        except Exception as e:
+            print(f"Error updating preview: {e}")
+            traceback.print_exc()
+
+class LocalBettingManager:
+    def __init__(self):
+        self.players = {}
+        self.current_bets = {"1": {}, "2": {}}
+        self.betting_active = False
+        self.betting_window = None
+        self.betting_log = []  # Add betting log list
+        
+    def log_bet(self, message):
+        """Add a timestamped message to the betting log"""
+        timestamp = time.strftime("%H:%M:%S")
+        self.betting_log.append(f"[{timestamp}] {message}")
+        
+    def initialize_players(self, num_players, starting_points):
+        """Initialize or reset players with starting points"""
+        self.players = {}
+        self.betting_log = []  # Reset betting log
+        for i in range(1, num_players + 1):
+            self.players[f"Player {i}"] = {
+                "points": starting_points,
+                "total_bets": 0,
+                "total_wins": 0,
+                "total_losses": 0
+            }
+        self.log_bet(f"Initialized {num_players} players with {starting_points} points each")
+        
+    def place_bet(self, player_name, team, amount):
+        """Place a bet for a player"""
+        if not self.betting_active:
+            self.log_bet(f"Bet rejected: Betting is not active ({player_name})")
+            return False, "Betting is not active"
+            
+        if player_name not in self.players:
+            self.log_bet(f"Bet rejected: Invalid player ({player_name})")
+            return False, "Invalid player"
+            
+        if team not in ["1", "2"]:
+            self.log_bet(f"Bet rejected: Invalid team ({player_name}, Team {team})")
+            return False, "Invalid team"
+            
+        try:
+            amount = int(amount)
+        except ValueError:
+            self.log_bet(f"Bet rejected: Invalid amount format ({player_name}, {amount})")
+            return False, "Bet amount must be a number"
+            
+        if amount <= 0:
+            self.log_bet(f"Bet rejected: Invalid amount ({player_name}, {amount})")
+            return False, "Bet amount must be positive"
+            
+        if amount > self.players[player_name]["points"]:
+            self.log_bet(f"Bet rejected: Insufficient points ({player_name}, {amount})")
+            return False, "Not enough points"
+            
+        # Remove any existing bet for this player
+        for team_bets in self.current_bets.values():
+            if player_name in team_bets:
+                old_bet = team_bets.pop(player_name)
+                self.players[player_name]["points"] += old_bet
+                self.log_bet(f"Removed previous bet: {player_name} - {old_bet} points")
+                
+        # Place new bet
+        self.current_bets[team][player_name] = amount
+        self.players[player_name]["points"] -= amount
+        self.players[player_name]["total_bets"] += 1
+        
+        self.log_bet(f"Bet placed: {player_name} - {amount} points on Team {team}")
+        self.save_state()  # Save state after each bet
+        
+        return True, f"Placed {amount} points on Team {team}"
+        
+    def handle_battle_result(self, winner, p1, p2):
+        """Process battle result and distribute winnings"""
+        if not self.betting_active:
+            return []
+            
+        self.log_bet(f"Processing battle result - Winner: {winner}")
+        
+        # Determine winning team
+        winning_team = "1" if winner == p1 else "2"
+        losing_team = "2" if winning_team == "1" else "1"
+        
+        # Calculate pools
+        winning_pool = sum(self.current_bets[winning_team].values())
+        losing_pool = sum(self.current_bets[losing_team].values())
+        total_pool = winning_pool + losing_pool
+        
+        self.log_bet(f"Betting pools - Winners: {winning_pool}, Losers: {losing_pool}, Total: {total_pool}")
+        
+        # Track winners and their earnings
+        winners_earnings = []
+        
+        if total_pool > 0:
+            # Calculate payout ratio with minimum 1.1x and maximum 10x
+            if winning_pool > 0:
+                # Base payout ratio is total_pool / winning_pool
+                payout_ratio = total_pool / winning_pool
+                # Ensure minimum 1.1x payout
+                payout_ratio = max(1.1, min(10.0, payout_ratio))
+                self.log_bet(f"Payout ratio calculated: {payout_ratio:.2f}x")
+            else:
+                # If no winners, use maximum payout
+                payout_ratio = 10.0
+                self.log_bet("No winners - using maximum payout ratio (10.0x)")
+            
+            # Process winners
+            for player, bet in self.current_bets[winning_team].items():
+                # Calculate winnings (original bet * payout ratio)
+                winnings = int(bet * payout_ratio)
+                # Add winnings to player's points
+                self.players[player]["points"] += winnings
+                self.players[player]["total_wins"] += 1
+                # Calculate profit (winnings minus original bet)
+                profit = winnings - bet
+                winners_earnings.append((player, winnings, bet, profit))
+                self.log_bet(f"Winner {player} - Bet: {bet}, Payout Ratio: {payout_ratio:.2f}x, Winnings: {winnings}, Profit: {profit}, New Balance: {self.players[player]['points']}")
+            
+            # Process losers
+            for player, bet in self.current_bets[losing_team].items():
+                # Losers already had their bets deducted when placing them
+                self.players[player]["total_losses"] += 1
+                winners_earnings.append((player, 0, bet, -bet))
+                self.log_bet(f"Loser {player} - Lost bet: {bet}, New Balance: {self.players[player]['points']}")
+        
+        # Reset betting state
+        self.betting_active = False
+        self.current_bets = {"1": {}, "2": {}}
+        
+        # Sort winners by profit (highest to lowest)
+        winners_earnings.sort(key=lambda x: x[3], reverse=True)
+        
+        # Save state after processing results
+        self.save_state()
+        
+        return winners_earnings
+        
+    def save_state(self):
+        """Save the current state of bets"""
+        self.current_bets = {team: dict(bets) for team, bets in self.current_bets.items()}
+
+class BettingWindow(tk.Toplevel):
+    def __init__(self, parent, betting_manager, battle_info):
+        super().__init__(parent.root)
+        self.title("Local Betting")
+        self.parent = parent
+        self.betting_manager = betting_manager
+        self.battle_info = battle_info
+        
+        # Window settings
+        self.geometry("600x800")  # Increased size to accommodate log
+        self.resizable(False, False)
+        self.transient(parent.root)
+        self.grab_set()
+        
+        # Create timer variable
+        self.time_remaining = int(parent.local_betting_time_var.get())
+        
+        # Initialize betting log if not exists
+        if not hasattr(betting_manager, 'betting_log'):
+            betting_manager.betting_log = []
+        
+        self.setup_ui()
+        self.start_timer()
+        self.update_log()
+        
+    def setup_ui(self):
+        """Setup the betting window UI"""
+        # Create main frame with scrollbar
+        main_frame = ttk.Frame(self)
+        main_frame.pack(fill='both', expand=True)
+        
+        # Top section (battle info, timer, players)
+        top_frame = ttk.Frame(main_frame)
+        top_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Battle info
+        info_frame = ttk.LabelFrame(top_frame, text="Battle Information")
+        info_frame.pack(fill='x', pady=5)
+        
+        if self.battle_info["mode"] == "single":
+            battle_text = f"{self.battle_info['p1']} vs {self.battle_info['p2']}"
+        else:
+            team1 = " & ".join(self.battle_info['p1'])
+            team2 = " & ".join(self.battle_info['p2'])
+            battle_text = f"Team 1: {team1}\nTeam 2: {team2}"
+            
+        battle_label = ttk.Label(info_frame, text=battle_text, wraplength=350)
+        battle_label.pack(padx=5, pady=5)
+        
+        # Timer
+        self.timer_label = ttk.Label(info_frame, text=f"Time remaining: {self.time_remaining}s",
+                                   font=("Arial", 12, "bold"))
+        self.timer_label.pack(pady=5)
+        
+        # Player list
+        players_frame = ttk.LabelFrame(top_frame, text="Players")
+        players_frame.pack(fill='x', pady=5)
+        
+        # Create player frames
+        self.player_frames = {}
+        for player_name, stats in self.betting_manager.players.items():
+            player_frame = ttk.Frame(players_frame)
+            player_frame.pack(fill='x', padx=5, pady=5)
+            
+            # Player name and points
+            name_label = ttk.Label(player_frame, text=f"{player_name}:",
+                                 font=("Arial", 10, "bold"))
+            name_label.pack(side='left', padx=5)
+            
+            points_label = ttk.Label(player_frame, 
+                                   text=f"{stats['points']} points")
+            points_label.pack(side='left', padx=5)
+            
+            # Bet entry
+            bet_var = tk.StringVar()
+            bet_entry = ttk.Entry(player_frame, textvariable=bet_var, width=8)
+            bet_entry.pack(side='left', padx=5)
+            
+            # Team selection
+            team_var = tk.StringVar(value="1")
+            team1_radio = ttk.Radiobutton(player_frame, text="Team 1",
+                                        variable=team_var, value="1")
+            team1_radio.pack(side='left')
+            
+            team2_radio = ttk.Radiobutton(player_frame, text="Team 2",
+                                        variable=team_var, value="2")
+            team2_radio.pack(side='left')
+            
+            # Store references
+            self.player_frames[player_name] = {
+                "points_label": points_label,
+                "bet_var": bet_var,
+                "team_var": team_var
+            }
+        
+        # Add betting log
+        log_frame = ttk.LabelFrame(main_frame, text="Betting Log")
+        log_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Create scrolled text widget for log
+        self.log_text = ScrolledText(log_frame, height=10, wrap=tk.WORD)
+        self.log_text.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Betting controls
+        controls_frame = ttk.Frame(main_frame)
+        controls_frame.pack(fill='x', padx=10, pady=5)
+        
+        place_bets_btn = ttk.Button(controls_frame, text="Place Bets",
+                                  command=self._place_bets)
+        place_bets_btn.pack(side='left', padx=5)
+        
+        cancel_btn = ttk.Button(controls_frame, text="Cancel",
+                              command=self.destroy)
+        cancel_btn.pack(side='right', padx=5)
+        
+    def update_log(self):
+        """Update the betting log display"""
+        if hasattr(self, 'log_text'):
+            self.log_text.configure(state='normal')
+            self.log_text.delete('1.0', tk.END)
+            for log_entry in self.betting_manager.betting_log:
+                self.log_text.insert(tk.END, log_entry + '\n')
+            self.log_text.see(tk.END)
+            self.log_text.configure(state='disabled')
+            
+        # Schedule next update
+        if self.time_remaining > 0:
+            self.after(1000, self.update_log)
+            
+    def start_timer(self):
+        """Start countdown timer"""
+        if self.time_remaining > 0:
+            self.timer_label.config(text=f"Time remaining: {self.time_remaining}s")
+            self.time_remaining -= 1
+            self.after(1000, self.start_timer)
+        else:
+            self._place_bets()
+            
+    def _place_bets(self):
+        """Process and place all bets"""
+        success = True
+        messages = []
+        min_bet = int(self.parent.min_bet_var.get())
+        max_bet = int(self.parent.max_bet_var.get())
+        
+        for player_name, widgets in self.player_frames.items():
+            bet_amount = widgets["bet_var"].get().strip()
+            if bet_amount:
+                try:
+                    amount = int(bet_amount)
+                    # Validate bet amount
+                    if amount < min_bet:
+                        messages.append(f"{player_name}: Bet too small (minimum {min_bet})")
+                        success = False
+                        continue
+                    if amount > max_bet:
+                        messages.append(f"{player_name}: Bet too large (maximum {max_bet})")
+                        success = False
+                        continue
+                        
+                    team = widgets["team_var"].get()
+                    result, msg = self.betting_manager.place_bet(player_name, team, amount)
+                    if not result:
+                        success = False
+                    messages.append(msg)
+                except ValueError:
+                    success = False
+                    messages.append(f"Invalid bet amount for {player_name}")
+        
+        # Update log one final time
+        self.update_log()
+                    
+        if success:
+            messagebox.showinfo("Success", "\n".join(messages))
+            self.destroy()
+        else:
+            messagebox.showerror("Error", "\n".join(messages))
+            # Keep window open on error
 
 if __name__ == "__main__":
     manager = MugenBattleManager()
